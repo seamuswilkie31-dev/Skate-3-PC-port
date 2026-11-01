@@ -45,6 +45,10 @@ int main(int argc, char** argv) {
         else if (key == "--stall") options.stallSeconds = uint32_t(std::atoi(argv[i + 1]));
         else if (key == "--time-limit") options.timeLimitSeconds = uint32_t(std::atoi(argv[i + 1]));
         else if (key == "--watch") options.watchAddress = uint32_t(std::strtoul(argv[i + 1], nullptr, 16));
+        else if (key == "--watch-reads") {
+            options.watchAddress = uint32_t(std::strtoul(argv[i + 1], nullptr, 16));
+            options.watchReads = true;
+        }
         // --config (from the launcher) is accepted and not used yet.
     }
 

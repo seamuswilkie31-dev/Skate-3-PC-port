@@ -117,8 +117,11 @@ LONG CALLBACK OnException(EXCEPTION_POINTERS* info) {
     case EXCEPTION_SINGLE_STEP: {
         if (!gOptions.watchAddress || !(info->ContextRecord->Dr6 & 1)) return EXCEPTION_CONTINUE_SEARCH;
         info->ContextRecord->Dr6 = 0;
-        int n = std::snprintf(reason, sizeof reason, "watch: t%u wrote %08X to 0x%08X", thread,
-                              LoadBE32(gMemory->base(), gOptions.watchAddress), gOptions.watchAddress);
+        // Reading the word here would trip a read watch again, so only writes show the value.
+        int n = gOptions.watchReads
+                    ? std::snprintf(reason, sizeof reason, "watch: t%u accessed 0x%08X", thread, gOptions.watchAddress)
+                    : std::snprintf(reason, sizeof reason, "watch: t%u wrote %08X to 0x%08X", thread,
+                                    LoadBE32(gMemory->base(), gOptions.watchAddress), gOptions.watchAddress);
         DescribeFault(reason + n, sizeof reason - n, *info->ContextRecord);
         Log("%s\n", reason);
         return EXCEPTION_CONTINUE_EXECUTION;
@@ -184,7 +187,8 @@ void WatchThread(void* hostThread) {
     c.ContextFlags = CONTEXT_DEBUG_REGISTERS;
     if (!GetThreadContext(hostThread, &c)) return;
     c.Dr0 = reinterpret_cast<uintptr_t>(gMemory->base() + (gOptions.watchAddress & ~3u));
-    c.Dr7 = 1 | (1 << 16) | (3 << 18);  // local breakpoint 0: on writes, 4 bytes
+    // Local breakpoint 0, 4 bytes, on writes (01) or on reads and writes (11).
+    c.Dr7 = 1 | ((gOptions.watchReads ? 3u : 1u) << 16) | (3 << 18);
     SetThreadContext(hostThread, &c);
 }
 

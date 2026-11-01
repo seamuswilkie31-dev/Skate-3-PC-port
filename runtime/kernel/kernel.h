@@ -23,6 +23,7 @@ struct Options {
     uint32_t stallSeconds = 15;  // end the run if no kernel call happens for this long
     uint32_t timeLimitSeconds = 120;
     uint32_t watchAddress = 0;  // log every guest write to this word (a hardware breakpoint)
+    bool watchReads = false;    // ...and every read
 };
 
 // Installs the fault handler, starts the watchdog and the clock.

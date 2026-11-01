@@ -231,6 +231,8 @@ drawn yet. It reads most of its data and starts decoding the EA intro movie.
 - **Diagnostics.** A `gpu:` section in every run report gives the ring state,
   frame and interrupt counts, packet counts by opcode, and any wait in
   progress. `S3N_GPU_TRACE=<n>` logs the first n packets in full.
+  `--watch-reads <address>` reports every read of a word as well as every
+  write.
 
 ### How far the game gets
 
@@ -249,14 +251,59 @@ both expected for now: the game probes `\Device\Harddisk0\partition0`
 (there's no hard drive yet), and one video-memory set-up list has a stated
 length that cuts its last packet short, which is harmless and skipped.
 
+## Done: the render-thread crash, fixed with an audio clock
+
+The crash wasn't a memory bug in the runtime. Here is how it was traced:
+
+1. **The object.** A write watch on the buffer object's `+0x30` field showed
+   the base pointer being overwritten by the render thread itself, with a
+   float.
+2. **The overflow.** The object sits right after its own buffer, about
+   250 KB of 16-byte records. The 16,000th append ran off the end and over
+   the object.
+3. **The resets.** A watch on the write offset (`+0xCC`) showed it never
+   reset in 32 seconds.
+4. **The reads.** A read watch on the first record (new: `--watch-reads`)
+   showed nothing ever read it.
+5. **What the records are.** Each one is a "set parameter" command: a
+   function, an object, a slot and a float. The game builds this list every
+   frame and normally executes and resets it.
+
+The list only grew because the game was stuck early in its boot sequence. Its
+audio engine had registered with the console's audio render driver
+(`XAudioRegisterRenderDriverClient`), which was a placeholder, so the
+engine's callback never ran. Everything timed by audio stood still,
+including the EA intro movie, which never finished.
+
+`kernel/audio_imports.cpp` now provides that clock. A runtime-owned guest
+thread calls each registered client's callback once per 256-sample frame
+(48 kHz, about 5.3 ms), passing a pointer to the client's argument word as
+the console does. Submitted frames are counted and dropped until audio output
+(phase 4). Speaker configuration and category volumes report stereo and full
+volume.
+
+With the clock running, the intro movie plays to the end, its decoder
+thread exits, and the run reaches the time limit with no crash. Two runs gave
+the same result.
+
+### The new stop: the XMA audio decoder
+
+About 26 seconds in, the game's audio core thread (`RwAudioCore Dac`)
+starts streaming through the XMA hardware decoder. The `XMA*` functions are
+still placeholders, so input buffers never get consumed. The thread then
+spins through them, about 900 million calls in 90 seconds, while holding a
+lock. The render thread waits on that lock, and frames stop.
+
 ## Next
 
-1. **The render-thread crash.** Find what sets that buffer pointer, with
-   `--watch` on the object's `+0x30` field.
+1. **XMA** (phase 4). First a decoder that consumes input buffers and
+   produces silence, implementing the `XMA*` context functions over the
+   context structures in guest memory. That unblocks the boot sequence.
+   Real XMA decoding and output through SDL3 come after.
 2. **Rendering.** Translate the draws the command processor now sees:
    shaders through XenosRecomp, the Vulkan backend, then `VdSwap` presenting
    the front buffer in a window.
-3. **Audio** (phase 4): the XMA decoder behind `0x7FEA0000` and the audio
-   threads.
-4. **Saves** (phase 5): the hard drive and cache partitions, then the content
-   APIs.
+3. **Input** (phase 4): pads through SDL3, and keyboard and mouse mapped onto
+   the same virtual pad (see the roadmap).
+4. **Saves and DLC** (phase 5): the hard drive and cache partitions, the
+   content APIs, and importing your save and DLC packages.

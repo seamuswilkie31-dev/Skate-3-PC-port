@@ -59,6 +59,8 @@ That boundary is where all the Skate 3-specific reverse engineering happens.
 | Multiplayer via Radmin | Radmin VPN is a virtual LAN (26.x.x.x addresses). Step one is finding out how the game's multiplayer finds sessions: if it has a LAN/system-link path we route it over the Radmin adapter; if it only knows EA's online backend we re-implement that session layer, host-as-server, over UDP | Phase 7 | High, and the biggest unknown: research first |
 | Xbox One controller | SDL3 gamepad → XInput state | Phase 4 | Low |
 | PS4 and Switch controllers | Same SDL3 path (DualShock 4, DualSense, Switch Pro, Joy-Con pairs), plus Nintendo positional layout. Matching on-screen button prompts means swapping UI textures: later polish | Input phase 4, prompts phase 8 | Low / Medium |
+| Keyboard and mouse | Turned into the same virtual pad the game reads. Keys drive the left stick (WASD by default; a key pressed means full tilt, so diagonals and a walk modifier matter). Mouse movement drives the right stick for Flick-It: each motion becomes a stick deflection that springs back to centre, with sensitivity, a deadzone and a return speed to tune, so a quick flick reads as a flick. Keys and mouse buttons cover the face buttons, bumpers, triggers, D-pad, Start and Back. Bindings in the launcher's Controls page, next to the pad tester | Phase 4 | Medium: the stick feel needs tuning on real tricks |
+| Your DLC | Import the DLC packages you own (from a USB stick or hard-drive dump of your 360) in the launcher, the same way as saves. The runtime mounts them as installed content for the game's content APIs (its `dlc_enumerator` thread already looks for them). Only packages you supply, never downloaded | Import phase 5, use phase 5 | Medium |
 
 ## Phases and exit criteria
 
@@ -90,13 +92,18 @@ ISO), timers, XAM content/profile APIs. Identify the D3D library functions
 and hook them. Vulkan device, swapchain, shader translation. *Exit:* first
 frame — the EA logo / main menu renders.
 
-**Phase 4 — Input & audio.** SDL3 gamepads mapped to XInput; XMA audio
-decode. *Exit:* menus are navigable with Xbox, PlayStation and Switch pads,
-with sound.
+**Phase 4 — Input & audio.** SDL3 gamepads mapped to XInput; keyboard and
+mouse mapped onto the same virtual pad (keys for the left stick and buttons,
+mouse movement for the right stick and Flick-It), with bindings in the
+launcher; XMA audio decode. *Exit:* menus are navigable with Xbox,
+PlayStation and Switch pads and with keyboard and mouse, with sound, and
+basic flick tricks land with the mouse.
 
-**Phase 5 — Saves & progression.** Content APIs backed by
-`%APPDATA%/Skate3Native/saves`, import of your 360 save, unlock-all option.
-*Exit:* your imported skater loads; a new save round-trips.
+**Phase 5 — Saves, DLC & progression.** Content APIs backed by
+`%APPDATA%/Skate3Native/saves`, import of your 360 save, import of the DLC
+packages you own (mounted as installed content), unlock-all option.
+*Exit:* your imported skater loads; a new save round-trips; imported DLC
+shows up in the game.
 
 **Phase 6 — Gameplay & frame rate.** Fix rendering/simulation bugs through a
 full playthrough. Locate the frame limiter and every frame-time-dependent
