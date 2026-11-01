@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <map>
 #include <mutex>
+#include <string>
 
 namespace s3n {
 
@@ -58,8 +59,11 @@ public:
     static constexpr uint32_t kStackBase = 0x70000000;
     static constexpr uint32_t kStackEnd = 0x7F000000;
 
-    bool Reserve();
+    // Reserves the 4 GB space and maps physical memory into its windows. On failure,
+    // `error` says why.
+    bool Reserve(std::string& error);
     uint8_t* base() const { return base_; }
+    // Commits title or runtime memory; physical windows are always committed.
     bool Commit(uint32_t address, uint32_t size);
 
     bool Contains(uintptr_t host) const {
@@ -79,13 +83,29 @@ public:
     void FreeStack(uint32_t address) { stacks_.Free(address); }
 
     // The console's 512 MB of physical memory, handed out first-fit from 1 MB up (so no
-    // allocation looks like a null pointer). Returns the physical address, or kNoPhysical.
+    // allocation looks like a null pointer). It's one block of host memory seen through
+    // all three windows (0xA0000000 64 KB pages, 0xC0000000 16 MB, 0xE0000000 4 KB), so a
+    // write through one shows in the others; it's always committed.
+    //
+    // On the console the 4 KB window is shifted: 0xE0000000 + x is physical x + 0x1000,
+    // and titles compute GPU addresses that way. Windows maps views on 64 KB boundaries
+    // only, so here every window starts at offset 0 instead, and the shift is applied
+    // to addresses: a 4 KB-window allocation keeps a spare page after it (so its shifted
+    // range overlaps nothing else) and GPU addresses inside it are shifted back.
     static constexpr uint32_t kPhysicalSize = 0x20000000;
     static constexpr uint32_t kPhysicalStart = 0x00100000;
     static constexpr uint32_t kNoPhysical = RangeAllocator::kNone;
-    uint32_t AllocPhysical(uint32_t size, uint32_t align, uint32_t limit) { return physical_.Alloc(size, align, limit); }
-    bool FreePhysical(uint32_t address) { return physical_.Free(address) != 0; }
+    static constexpr uint32_t kPhysicalWindows[3] = {0xA0000000, 0xC0000000, 0xE0000000};
+    static constexpr uint32_t kSmallPageWindowShift = 0x1000;
+    // Returns the offset into physical memory (window + offset is the CPU address), or
+    // kNoPhysical. `smallPageWindow`: for the 4 KB window.
+    uint32_t AllocPhysical(uint32_t size, uint32_t align, uint32_t limit, bool smallPageWindow);
+    bool FreePhysical(uint32_t offset);
     uint32_t PhysicalAvailable() { return physical_.Available(); }
+    // The physical address the console gives a CPU address in a physical window
+    // (MmGetPhysicalAddress), and the host memory behind a GPU (physical) address.
+    uint32_t ConsolePhysical(uint32_t address) const;
+    uint8_t* Physical(uint32_t gpuAddress);
 
 private:
     uint8_t* base_ = nullptr;
@@ -96,6 +116,8 @@ private:
     uint32_t virtualNext_ = kVirtualBase;
     RangeAllocator stacks_{kStackBase, kStackEnd - kStackBase};
     RangeAllocator physical_{kPhysicalStart, kPhysicalSize - kPhysicalStart};
+    std::mutex shiftedMutex_;
+    std::map<uint32_t, uint32_t> shifted_;  // 4 KB-window allocations: GPU start -> GPU end
 };
 
 }  // namespace s3n

@@ -10,6 +10,8 @@ void DefineVariable(const std::string& name, uint32_t address) {
     uint8_t* base = Memory().base();
     if (name == "KeTimeStampBundle") {
         SetTimeStampBundle(address);
+    } else if (name == "VdHSIOCalibrationLock") {
+        InitializeCriticalSection(base, address, 0);  // the title takes it around EDRAM retraining
     } else if (name == "XboxHardwareInfo") {
         base[address + 4] = 6;  // +0 flags, +4 number of hardware threads
     }

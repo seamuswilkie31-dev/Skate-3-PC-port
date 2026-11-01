@@ -43,6 +43,9 @@ std::atomic<const char*> gOrder[kImportSlots];  // imports in order of first cal
 std::atomic<uint32_t> gOrderCount{0};
 RecentCall gRecent[16];
 std::atomic<bool> gFinishing{false};
+constexpr size_t kMaxReportSections = 8;
+std::atomic<std::string (*)()> gReportSections[kMaxReportSections];
+std::atomic<size_t> gReportSectionCount{0};
 
 int64_t NowMs() {
     return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - gStart).count();
@@ -209,6 +212,11 @@ void Trace(PPCContext& ctx, const char* name, bool implemented) {
     }
 }
 
+void AddReportSection(std::string (*describe)()) {
+    size_t slot = gReportSectionCount.fetch_add(1);
+    if (slot < kMaxReportSections) gReportSections[slot] = describe;
+}
+
 void UnimplementedImport(PPCContext& ctx, uint8_t*, const char* name) {
     Trace(ctx, name, false);
     ctx.r3.u64 = 0;  // STATUS_SUCCESS / ERROR_SUCCESS / NULL
@@ -229,6 +237,8 @@ void Finish(const char* reason, int exitCode) {
     };
     log("\n==== run ended after %.1f s: %s\n", NowMs() / 1000.0, reason);
     log("guest threads:\n%s", DescribeThreads().c_str());
+    for (size_t i = 0; i < std::min(gReportSectionCount.load(), kMaxReportSections); ++i)
+        if (auto describe = gReportSections[i].load()) log("%s", describe().c_str());
     uint64_t calls = gCalls.load();
     log("last kernel calls (oldest first):\n");
     for (uint64_t i = calls > 15 ? calls - 15 : 1; i <= calls; ++i) {

@@ -84,11 +84,13 @@ PPC_FUNC(__imp__MmAllocatePhysicalMemoryEx) {
     uint32_t limit = maxAddress ? uint32_t(std::min<uint64_t>(uint64_t(maxAddress) + 1, GuestMemory::kPhysicalSize))
                                 : GuestMemory::kPhysicalSize;
     size = RoundUp(size, page);
-    uint32_t physical = memory.AllocPhysical(size, alignment > page ? alignment : page, limit);
+    uint32_t physical = memory.AllocPhysical(size, alignment > page ? alignment : page, limit, window == kWindow4K);
     if (size == 0 || physical == GuestMemory::kNoPhysical || !memory.Commit(window + physical, size)) {
+        Log("  MmAllocatePhysicalMemoryEx: %08X bytes: none left\n", ctx.r4.u32);
         ctx.r3.u64 = 0;
         return;
     }
+    Log("  MmAllocatePhysicalMemoryEx: %08X bytes at %08X\n", ctx.r4.u32, window + physical);
     ctx.r3.u64 = window + physical;
 }
 
@@ -99,10 +101,10 @@ PPC_FUNC(__imp__MmFreePhysicalMemory) {
     Memory().FreePhysical(ctx.r4.u32 & (GuestMemory::kPhysicalSize - 1));
 }
 
-// u32 MmGetPhysicalAddress(void* address)
+// u32 MmGetPhysicalAddress(void* address): the 4 KB window is one page off (see memory.h).
 PPC_FUNC(__imp__MmGetPhysicalAddress) {
     Trace(ctx, "MmGetPhysicalAddress", true);
-    ctx.r3.u64 = ctx.r3.u32 & (GuestMemory::kPhysicalSize - 1);
+    ctx.r3.u64 = Memory().ConsolePhysical(ctx.r3.u32);
 }
 
 // NTSTATUS MmQueryStatistics(MM_STATISTICS* stats)

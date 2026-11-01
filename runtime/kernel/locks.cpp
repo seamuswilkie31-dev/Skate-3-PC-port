@@ -40,16 +40,6 @@ bool CompareExchange(uint8_t* base, uint32_t address, uint32_t expected, uint32_
     return Word(base, address).compare_exchange_strong(old, __builtin_bswap32(desired));
 }
 
-void InitializeCriticalSection(uint8_t* base, uint32_t cs, uint32_t spinCount) {
-    for (uint32_t offset = 0; offset < 0x1C; offset += 4) StoreBE32(base, cs + offset, 0);
-    base[cs] = kSynchronizationEvent;
-    base[cs + kCsSpinCount] = uint8_t(std::min<uint32_t>((spinCount + 255) / 256, 255));
-    base[cs + 2] = 4;                     // header size in words
-    StoreBE32(base, cs + 0x08, cs + 0x08);  // empty wait list
-    StoreBE32(base, cs + 0x0C, cs + 0x08);
-    StoreBE32(base, cs + kCsLockCount, 0xFFFFFFFF);
-}
-
 void TakeOwnership(uint8_t* base, uint32_t cs, uint32_t thread) {
     StoreBE32(base, cs + kCsOwner, thread);
     StoreBE32(base, cs + kCsRecursion, 1);
@@ -68,6 +58,17 @@ thread_local uint32_t tIrql = 0;
 constexpr uint32_t kDispatchLevel = 2;
 
 }  // namespace
+
+void InitializeCriticalSection(uint8_t* base, uint32_t cs, uint32_t spinCount) {
+    for (uint32_t offset = 0; offset < 0x1C; offset += 4) StoreBE32(base, cs + offset, 0);
+    base[cs] = kSynchronizationEvent;
+    base[cs + kCsSpinCount] = uint8_t(std::min<uint32_t>((spinCount + 255) / 256, 255));
+    base[cs + 2] = 4;                     // header size in words
+    StoreBE32(base, cs + 0x08, cs + 0x08);  // empty wait list
+    StoreBE32(base, cs + 0x0C, cs + 0x08);
+    StoreBE32(base, cs + kCsLockCount, 0xFFFFFFFF);
+}
+
 }  // namespace s3n::kernel
 
 using namespace s3n;

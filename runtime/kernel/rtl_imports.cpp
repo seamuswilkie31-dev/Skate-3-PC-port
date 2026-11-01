@@ -29,6 +29,13 @@ PPC_FUNC(__imp__RtlInitAnsiString) {
     StoreBE32(base, string + 4, source);
 }
 
+// void RtlFillMemoryUlong(void* destination, u32 length, u32 pattern): length in bytes.
+PPC_FUNC(__imp__RtlFillMemoryUlong) {
+    Trace(ctx, "RtlFillMemoryUlong", true);
+    uint32_t destination = ctx.r3.u32, words = ctx.r4.u32 / 4, pattern = ctx.r5.u32;
+    for (uint32_t i = 0; i < words; ++i) StoreBE32(base, destination + i * 4, pattern);
+}
+
 // void RtlRaiseException(EXCEPTION_RECORD* record)
 // EXCEPTION_RECORD: code, flags, nested record, address, parameter count, parameters[15].
 // The title raises the SetThreadName exception to name each thread it creates; with no

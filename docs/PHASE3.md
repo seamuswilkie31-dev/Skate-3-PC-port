@@ -3,8 +3,9 @@
 Goal: implement the kernel in the order the game needs it, until the first
 frame renders. Steps (from [PHASE2.md](PHASE2.md)): threads, real
 synchronization objects, files from the ISO, then whatever the log asks for
-next, up to D3D device creation. All of those are done; start-up now stops
-at the GPU itself (see the end of this page).
+next, up to D3D device creation. All of those are done, and so is the GPU's
+front end: the game now runs its boot sequence, presenting frames to a GPU
+that doesn't draw yet (see the end of this page).
 
 ## Done: threads and synchronization
 
@@ -169,18 +170,93 @@ and `VdGetCurrentDisplayGamma`, all still stubs. Then it writes the command
 processor's ring-buffer write pointer (register `0x1C5`, `CP_RB_WPTR`) through
 the GPU's memory-mapped registers at `0x7FC80000`, which aren't mapped yet.
 
-## Next: the GPU front end
+## Done: the GPU front end
 
-This is where the renderer work starts:
+The game now runs its boot sequence for about 32 seconds. It presents about
+1,425 frames and queues about 222,000 draw calls, which are counted but not
+drawn yet. It reads most of its data and starts decoding the EA intro movie.
 
-1. **GPU registers.** Map the register window at `0x7FC80000`.
-2. **Ring buffer.** A command processor thread that watches the write
-   pointer, reads the command packets the game's D3D library writes, and
-   advances the read pointer write-back so the game sees its commands
-   consumed. A first version can execute nothing and only log the packet
-   types.
-3. **Video.** Real answers from `VdQueryVideoMode`, `XGetVideoMode` and
-   friends (1280×720, 60 Hz), and the graphics interrupt (vertical blank and
-   swap) called at 60 Hz on the game's callback.
-4. Then the packets themselves: draw calls, shaders (XenosRecomp) and the
-   Vulkan backend.
+- **Physical memory is aliased** (`runtime/memory.cpp`). The console sees its
+  512 MB through three windows (`0xA0000000`, `0xC0000000`, `0xE0000000`).
+  The game writes GPU data through one and the GPU reads it by physical
+  address. The guest space is now one placeholder reservation (Windows 10
+  1803+), and each window is a view of the same 512 MB section.
+- **The 4 KB window is one page off.** The game's Direct3D converts CPU to
+  GPU addresses inline, and for the `0xE0000000` window it adds 4 KB: on the
+  console, `0xE0000000 + x` is physical `x + 0x1000`. Windows can't map a
+  view at a 4 KB offset (views are placed on 64 KB boundaries), so the shift
+  is modelled instead:
+  - `MmGetPhysicalAddress` adds the shift.
+  - 4 KB-window allocations keep a spare page after them, so shifted ranges
+    never collide with other allocations.
+  - The GPU shifts addresses back when they fall inside such an allocation.
+
+  Without this, the game's interrupt record and the GPU's scratch area,
+  which are the same memory on the console, were different pages, and the
+  first GPU interrupt was never acknowledged.
+- **The register window** (`0x7FC80000`, 64 KB) is ordinary memory that the
+  command processor shares with the CPU:
+  - The CPU's write to `CP_RB_WPTR` is what the command processor polls for.
+  - Scratch registers enabled in `SCRATCH_UMSK` are mirrored to `SCRATCH_ADDR`
+    on every write, the GPU's or the CPU's.
+  - `COHER_STATUS_HOST` flushes complete as soon as they're waited on.
+  - The vertical-blank bit in the display interrupt status is set before each
+    vertical-blank interrupt; the game's handler checks it.
+- **The command processor** (`runtime/gpu/gpu.cpp`) is a host thread that
+  consumes the ring buffer and indirect buffers and reports its read pointer.
+  It carries out every packet that synchronizes with the CPU:
+  - register writes and `REG_RMW`;
+  - waits: `WAIT_REG_MEM`;
+  - memory writes: `MEM_WRITE`, `COND_WRITE`, `REG_TO_MEM`;
+  - fences: `EVENT_WRITE_SHD`;
+  - screen extents: `EVENT_WRITE_EXT`;
+  - constant loads into a full register file;
+  - predication through bin masks;
+  - `INTERRUPT`.
+
+  Draws and shader loads are counted and skipped.
+- **Interrupts** run on a runtime-owned guest thread: one per `INTERRUPT`
+  packet and a vertical blank every 1/60 s. Each calls the game's callback
+  with the right hardware-thread number in its processor block.
+- **Video functions** (`kernel/video_imports.cpp`):
+  - The display reports as 1280×720 at 60 Hz, widescreen.
+  - `VdSwap` fills its 64 reserved ring dwords with one no-op packet.
+  - The scaler command buffer is type-2 fillers.
+  - Engine set-up, EDRAM training and display persistence all succeed.
+
+  Also implemented: `RtlFillMemoryUlong`, and `VdHSIOCalibrationLock`, a
+  kernel variable that must be a ready critical section.
+- **The audio decoder's registers** (`0x7FEA0000`) are mapped as plain memory
+  until audio (phase 4), so writes to them don't fault.
+- **Diagnostics.** A `gpu:` section in every run report gives the ring state,
+  frame and interrupt counts, packet counts by opcode, and any wait in
+  progress. `S3N_GPU_TRACE=<n>` logs the first n packets in full.
+
+### How far the game gets
+
+| Run | What changed | Result |
+|---|---|---|
+| 14 | registers, ring buffer, interrupts, video | runs the full 60 s: the ring buffer is consumed and 3,594 vertical blanks are delivered; the main thread waits forever on `VdHSIOCalibrationLock` |
+| 15 | that lock set up | loads `shaders_final.big`, starts `render_thread`, presents 2 frames; the GPU waits for an interrupt acknowledgement |
+| 16 | scaler buffer, `RtlFillMemoryUlong`, scratch mirroring | the same wait: the handler clears its bit one page away from where the GPU looks |
+| 17 | the 4 KB window shift | interrupts acknowledged; 12 frames, 56 draws, audio and memory-card threads; then a write to the audio decoder's registers |
+| 18–19 | audio registers mapped | about 32 s, about 1,425 frames, about 222,000 draws, 30 archives read, the intro movie's decoder running; then `render_thread` writes through a bad pointer in `0x8247EFC0` |
+
+The last stop: a per-frame buffer object's base pointer (`+0x30`) holds an
+address no allocation covers (`0x3FE04178` in one run, different in the
+next), so something leaves it uninitialized or overwrites it. Also seen,
+both expected for now: the game probes `\Device\Harddisk0\partition0`
+(there's no hard drive yet), and one video-memory set-up list has a stated
+length that cuts its last packet short, which is harmless and skipped.
+
+## Next
+
+1. **The render-thread crash.** Find what sets that buffer pointer, with
+   `--watch` on the object's `+0x30` field.
+2. **Rendering.** Translate the draws the command processor now sees:
+   shaders through XenosRecomp, the Vulkan backend, then `VdSwap` presenting
+   the front buffer in a window.
+3. **Audio** (phase 4): the XMA decoder behind `0x7FEA0000` and the audio
+   threads.
+4. **Saves** (phase 5): the hard drive and cache partitions, then the content
+   APIs.

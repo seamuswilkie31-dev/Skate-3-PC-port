@@ -117,6 +117,11 @@ DWORD WINAPI RunThread(void* param) {
     ctx.r3.u64 = t.start.r3;
     ctx.r4.u64 = t.start.r4;
     t.ctx = &ctx;
+    if (t.start.hostBody) {
+        t.start.hostBody(ctx, base);
+        ExitGuestThread(t, 0);
+        return 0;
+    }
     PPCFunc* entry = GuestFunction(base, t.start.entry);
     if (!entry) {
         char reason[96];
@@ -144,6 +149,7 @@ uint32_t CreateGuestThread(const ThreadStart& start, uint32_t* threadId) {
     uint8_t* base = memory.base();
     auto t = std::make_unique<Thread>();
     t->start = start;
+    if (start.name) t->name = start.name;
 
     uint32_t stackSize = start.stackSize ? start.stackSize : gDefaultStackSize;
     stackSize = std::max<uint32_t>(0x4000, (stackSize + 0xFFF) & ~0xFFFu);
@@ -218,6 +224,13 @@ uint32_t CreateGuestThread(const ThreadStart& start, uint32_t* threadId) {
 uint32_t CurrentThread() { return tCurrent ? tCurrent->kthread : 0; }
 uint32_t CurrentThreadNumber() { return tCurrent ? tCurrent->number : 0; }
 PPCContext* CurrentContext() { return tCurrent ? tCurrent->ctx.load() : nullptr; }
+
+void SetCurrentProcessor(uint8_t processor) {
+    if (!tCurrent) return;
+    uint8_t* base = Memory().base();
+    base[tCurrent->pcr + kPcrProcessor] = processor;
+    base[tCurrent->kthread + kThreadProcessor] = processor;
+}
 
 void SetThreadName(uint32_t threadId, const std::string& name) {
     std::lock_guard lock(gThreadsMutex);

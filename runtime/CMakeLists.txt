@@ -30,7 +30,9 @@ add_custom_command(OUTPUT "${S3N_IMPORT_STUBS}"
     DEPENDS gen_import_stubs.py "${S3N_RECOMP_OUT}/ppc_recomp_shared.h" ${S3N_KERNEL_SOURCES}
     COMMENT "Generating import stubs")
 
-add_executable(s3native main.cpp memory.cpp loader.cpp disc.cpp ${S3N_KERNEL_SOURCES} "${S3N_IMPORT_STUBS}")
+file(GLOB S3N_GPU_SOURCES CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/gpu/*.cpp")
+add_executable(s3native main.cpp memory.cpp loader.cpp disc.cpp ${S3N_KERNEL_SOURCES} ${S3N_GPU_SOURCES}
+    "${S3N_IMPORT_STUBS}")
 target_include_directories(s3native PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
 target_compile_definitions(s3native PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
 target_link_libraries(s3native PRIVATE s3n_guest s3n_common)

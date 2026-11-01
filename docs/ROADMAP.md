@@ -82,8 +82,9 @@ kernel call they receive. *Exit:* the game's entry point runs and we see its
 first kernel calls.
 
 **Phase 3 — Kernel until graphics.** *(In progress: threads,
-synchronization and files done; the GPU front end is next. See
-[PHASE3.md](PHASE3.md).)* Implement kernel/XAM imports in the
+synchronization, files and the GPU front end done; the game runs its boot
+sequence without drawing. Rendering is next. See [PHASE3.md](PHASE3.md).)*
+Implement kernel/XAM imports in the
 order the game hits them: memory, threads, sync, files (served from the
 ISO), timers, XAM content/profile APIs. Identify the D3D library functions
 and hook them. Vulkan device, swapchain, shader translation. *Exit:* first

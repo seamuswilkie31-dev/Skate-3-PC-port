@@ -52,13 +52,49 @@ uint32_t RangeAllocator::Available() {
     return total;
 }
 
-bool GuestMemory::Reserve() {
-    base_ = static_cast<uint8_t*>(VirtualAlloc(nullptr, 1ull << 32, MEM_RESERVE, PAGE_NOACCESS));
-    return base_ && Commit(kSystemBase, kSystemSize);
+// The 4 GB space starts as one placeholder (Windows 10 1803+). The three physical
+// windows are split off and each replaced by a view of one 512 MB section, so they alias;
+// the rest becomes an ordinary reservation that's committed piece by piece.
+bool GuestMemory::Reserve(std::string& error) {
+    using VirtualAlloc2Fn = PVOID(WINAPI*)(HANDLE, PVOID, SIZE_T, ULONG, ULONG, MEM_EXTENDED_PARAMETER*, ULONG);
+    using MapViewOfFile3Fn =
+        PVOID(WINAPI*)(HANDLE, HANDLE, PVOID, ULONG64, SIZE_T, ULONG, ULONG, MEM_EXTENDED_PARAMETER*, ULONG);
+    HMODULE kernelBase = GetModuleHandleW(L"kernelbase.dll");
+    auto virtualAlloc2 = reinterpret_cast<VirtualAlloc2Fn>(GetProcAddress(kernelBase, "VirtualAlloc2"));
+    auto mapViewOfFile3 = reinterpret_cast<MapViewOfFile3Fn>(GetProcAddress(kernelBase, "MapViewOfFile3"));
+    auto fail = [&](const char* what) {
+        error = std::string(what) + " failed (Windows error " + std::to_string(GetLastError()) + ")";
+        return false;
+    };
+    if (!virtualAlloc2 || !mapViewOfFile3) {
+        error = "this version of Windows can't alias memory (needs Windows 10 1803 or later)";
+        return false;
+    }
+
+    HANDLE process = GetCurrentProcess();
+    base_ = static_cast<uint8_t*>(
+        virtualAlloc2(process, nullptr, 1ull << 32, MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, PAGE_NOACCESS, nullptr, 0));
+    if (!base_) return fail("reserving 4 GB");
+    for (uint32_t window : {kPhysicalWindows[0], kPhysicalWindows[1]})
+        if (!VirtualFree(base_ + window, kPhysicalSize, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER))
+            return fail("splitting the physical windows");
+    if (!virtualAlloc2(process, base_, kPhysicalWindows[0], MEM_RESERVE | MEM_REPLACE_PLACEHOLDER, PAGE_NOACCESS,
+                       nullptr, 0))
+        return fail("reserving virtual memory");
+
+    HANDLE section = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE | SEC_COMMIT, 0, kPhysicalSize,
+                                        nullptr);
+    if (!section) return fail("creating 512 MB of physical memory");
+    for (uint32_t window : kPhysicalWindows)
+        if (!mapViewOfFile3(section, process, base_ + window, 0, kPhysicalSize, MEM_REPLACE_PLACEHOLDER,
+                            PAGE_READWRITE, nullptr, 0))
+            return fail("mapping physical memory");
+    return Commit(kSystemBase, kSystemSize) || fail("committing system memory");
 }
 
 bool GuestMemory::Commit(uint32_t address, uint32_t size) {
-    return size == 0 || VirtualAlloc(base_ + address, size, MEM_COMMIT, PAGE_READWRITE) != nullptr;
+    if (size == 0 || address >= kPhysicalWindows[0]) return true;
+    return VirtualAlloc(base_ + address, size, MEM_COMMIT, PAGE_READWRITE) != nullptr;
 }
 
 uint32_t GuestMemory::AllocSystem(uint32_t size, uint32_t align) {
@@ -77,6 +113,39 @@ uint32_t GuestMemory::ReserveVirtual(uint32_t size, uint32_t page) {
     if (uint64_t(address) + size > (small ? kSmallPageEnd : kVirtualEnd)) return 0;
     next = address + size;
     return address;
+}
+
+uint32_t GuestMemory::AllocPhysical(uint32_t size, uint32_t align, uint32_t limit, bool smallPageWindow) {
+    if (!smallPageWindow) return physical_.Alloc(size, align, limit);
+    uint32_t offset = physical_.Alloc(size + kSmallPageWindowShift, align, limit);
+    if (offset != kNoPhysical) {
+        std::lock_guard lock(shiftedMutex_);
+        shifted_[offset + kSmallPageWindowShift] = offset + kSmallPageWindowShift + size;
+    }
+    return offset;
+}
+
+bool GuestMemory::FreePhysical(uint32_t offset) {
+    {
+        std::lock_guard lock(shiftedMutex_);
+        shifted_.erase(offset + kSmallPageWindowShift);
+    }
+    return physical_.Free(offset) != 0;
+}
+
+uint32_t GuestMemory::ConsolePhysical(uint32_t address) const {
+    uint32_t offset = address & (kPhysicalSize - 1);
+    return address >= kPhysicalWindows[2] ? (offset + kSmallPageWindowShift) & (kPhysicalSize - 1) : offset;
+}
+
+uint8_t* GuestMemory::Physical(uint32_t gpuAddress) {
+    uint32_t address = gpuAddress & (kPhysicalSize - 1);
+    {
+        std::lock_guard lock(shiftedMutex_);
+        auto it = shifted_.upper_bound(address);
+        if (it != shifted_.begin() && address < std::prev(it)->second) address -= kSmallPageWindowShift;
+    }
+    return base_ + kPhysicalWindows[0] + address;
 }
 
 uint32_t GuestMemory::AllocStack(uint32_t size) {

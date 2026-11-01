@@ -12,12 +12,13 @@ will be built, and the phase plan.
 
 ## Status
 
-Phase 3 in progress. Skate 3's recompiled code runs natively on 14 guest
-threads (its loader, timer, file-system, network and job threads) with real
-waits, events, semaphores, mutexes, critical sections and timers, and reads
-its data from your ISO. Start-up loads its first archives, sets up Direct3D
-and stops at the GPU's registers, where the renderer work begins. No
-graphics, audio or input yet. See [docs/PHASE3.md](docs/PHASE3.md) for the
+Phase 3 in progress. Skate 3's recompiled code runs natively on 21 guest
+threads (render, loader, file-system, audio, movie, network and job threads)
+with real waits, events, mutexes, critical sections and timers, reads its
+data from your ISO, and drives an emulated GPU front end. It runs its boot
+sequence for about 30 seconds: about 1,400 frames presented, 220,000 draw
+calls queued and the intro movie decoding. None of it is drawn yet, and
+there's no audio or input. See [docs/PHASE3.md](docs/PHASE3.md) for the
 details and what's next, and [docs/PHASE2.md](docs/PHASE2.md) for the
 recompilation work.
 
@@ -29,7 +30,7 @@ recompilation work.
 | `scripts/recomp.ps1` | ISO → `default.xex` → xexscan → 219 MB of C++, in the work folder |
 | XenonRecomp patches | 39 missing instruction forms, D3D half-float packs, the console's 50 MHz timebase, fixes; Skate 3 has 0 unrecognized instructions and 0 traps |
 | `scripts/test_recomp.ps1` | 110 instruction tests (344 checks) against a Python reference model |
-| Runtime (`s3native.exe`) | Runs the game's start-up natively: guest memory, loader, guest threads on host threads, kernel objects and waits, critical sections, timers, files from the disc; 73 kernel functions implemented, logging stubs for the other 213 |
+| Runtime (`s3native.exe`) | Runs the game's start-up natively: guest memory, loader, guest threads on host threads, kernel objects and waits, critical sections, timers, files from the disc, GPU front end (`runtime/gpu`); 95 kernel functions implemented, logging stubs for the other 191 |
 
 ## Requirements
 

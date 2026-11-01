@@ -82,6 +82,10 @@ struct ThreadStart {
     uint32_t stackSize = 0;  // 0: the XEX's default
     uint32_t flags = 0;      // ExCreateThread's creation flags (bit 0: start suspended)
     bool main = false;       // the title's main thread: its return ends the run
+    // A runtime thread instead: runs this host function with a guest context of its own,
+    // so it can call into title code (CallGuest), e.g. to deliver interrupts.
+    void (*hostBody)(PPCContext& ctx, uint8_t* base) = nullptr;
+    const char* name = nullptr;  // shown in reports
 };
 // Creates a guest thread (processor block, KTHREAD, TLS, stack) and the host thread that
 // runs it. Returns its KTHREAD with one reference for the caller, or 0.
@@ -95,6 +99,8 @@ uint32_t CurrentThreadNumber();
 PPCContext* CurrentContext();
 // Names a guest thread (by thread ID; 0xFFFFFFFF: the caller) in reports.
 void SetThreadName(uint32_t threadId, const std::string& name);
+// Which hardware thread (0-5) the calling guest thread reports running on.
+void SetCurrentProcessor(uint8_t processor);
 
 // Calls a guest function from kernel code on the calling thread; ctx is restored after.
 void CallGuest(PPCContext& ctx, uint8_t* base, uint32_t function, uint32_t r3, uint32_t r4, uint32_t r5);
@@ -140,6 +146,9 @@ void DereferenceObject(uint32_t object);
 uint32_t CreateHandle(uint32_t object);
 uint32_t LookupHandle(uint32_t handle);
 bool CloseHandle(uint32_t handle);
+
+// Sets up an RTL_CRITICAL_SECTION in guest memory, unowned (locks.cpp).
+void InitializeCriticalSection(uint8_t* base, uint32_t cs, uint32_t spinCount);
 
 // Sets an object's signal state and wakes threads waiting on it. Returns the old state.
 int32_t SignalObject(uint32_t object, int32_t state);
@@ -189,5 +198,8 @@ void UnimplementedImport(PPCContext& ctx, uint8_t* base, const char* name);
 // Prints why the run ended, every guest thread's state, the last kernel calls and a
 // per-import summary, then exits the process.
 [[noreturn]] void Finish(const char* reason, int exitCode);
+
+// Adds a section to the end-of-run report (the GPU's state, for one). Must not block.
+void AddReportSection(std::string (*describe)());
 
 }  // namespace s3n::kernel

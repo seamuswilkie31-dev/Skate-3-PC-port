@@ -10,6 +10,7 @@
 
 #include "config.h"
 #include "disc.h"
+#include "gpu/gpu.h"
 #include "kernel/kernel.h"
 #include "loader.h"
 #include "memory.h"
@@ -49,14 +50,25 @@ int main(int argc, char** argv) {
 
     options.log = std::fopen(logPath.c_str(), "w");
     GuestMemory memory;
-    if (!memory.Reserve()) {
-        std::fprintf(stderr, "s3native: can't reserve the 4 GB guest address space\n");
+    std::string error;
+    if (!memory.Reserve(error)) {
+        std::fprintf(stderr, "s3native: can't set up guest memory: %s\n", error.c_str());
         return 1;
     }
     kernel::Init(memory, options);
+    if (!gpu::Init(memory)) {
+        kernel::Log("s3native: can't map the GPU registers\n");
+        return 1;
+    }
+    // The XMA audio decoder's registers. Until audio (phase 4) they're plain memory, so
+    // the title's writes land somewhere and its reads see zeros.
+    constexpr uint32_t kAudioRegisters = 0x7FEA0000;
+    if (!memory.Commit(kAudioRegisters, 0x10000)) {
+        kernel::Log("s3native: can't map the audio registers\n");
+        return 1;
+    }
 
     LoadedGame game;
-    std::string error;
     if (!LoadGame(memory, xexPath, game, error)) {
         kernel::Log("s3native: %s\n", error.c_str());
         return 1;
