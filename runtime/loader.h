@@ -14,7 +14,7 @@ struct LoadedGame {
     uint32_t entryPoint = 0;
     size_t functionsMapped = 0;      // recompiled functions in the indirect-call table
     size_t functionImports = 0;      // kernel/XAM functions the game imports
-    std::vector<std::string> variables;  // imported kernel variables given zeroed storage
+    std::vector<std::pair<std::string, uint32_t>> variables;  // imported kernel variables: zeroed storage
 };
 
 // Decrypts and decompresses default.xex into guest memory at its base address, fills

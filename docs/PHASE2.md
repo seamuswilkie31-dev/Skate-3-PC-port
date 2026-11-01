@@ -190,6 +190,9 @@ its kernel calls are logged.**
 
 ## Phase 3, first steps
 
+Steps 1 and 2 are done, and the runtime's memory layout changed since: see
+[PHASE3.md](PHASE3.md).
+
 1. **Threads.** `ExCreateThread` running guest threads on host threads (each
    with its own context, stack, TLS block and processor block), and
    `KeDelayExecutionThread` actually sleeping.

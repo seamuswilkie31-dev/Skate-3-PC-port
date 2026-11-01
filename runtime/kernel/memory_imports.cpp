@@ -37,6 +37,7 @@ PPC_FUNC(__imp__NtAllocateVirtualMemory) {
     uint32_t page = (type & kMemLargePages) ? 0x10000 : 0x1000;
     uint32_t address = LoadBE32(base, basePtr);
     uint32_t size = LoadBE32(base, sizePtr);
+    Log("  NtAllocateVirtualMemory: %08X bytes at %08X, type %08X\n", size, address, type);
     if (size == 0 || !(type & (kMemCommit | kMemReserve))) {
         ctx.r3.u64 = kStatusInvalidParameter;
         return;

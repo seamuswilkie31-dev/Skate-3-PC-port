@@ -104,7 +104,7 @@ bool LoadGame(GuestMemory& memory, const std::filesystem::path& xexPath, LoadedG
                 return false;
             }
             StoreBE32(base, slot, storage);
-            game.variables.push_back(name);
+            game.variables.emplace_back(name, storage);
         }
     }
     return true;
