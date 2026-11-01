@@ -1,0 +1,379 @@
+diff --git a/XenonRecomp/recompiler.cpp b/XenonRecomp/recompiler.cpp
+index fa91527..4c9e541 100644
+--- a/XenonRecomp/recompiler.cpp
++++ b/XenonRecomp/recompiler.cpp
+@@ -523,8 +523,251 @@ bool Recompiler::Recompile(
+     if (id == PPC_INST_VUPKHSB128 && insn.operands[2] == 0x60) id = PPC_INST_VUPKHSH128;
+     else if (id == PPC_INST_VUPKLSB128 && insn.operands[2] == 0x60) id = PPC_INST_VUPKLSH128;
+ 
++    // Skate 3 Native: names of the CR bits a BI operand selects, and a conditional branch
++    // that also handles targets outside the function (tail calls).
++    constexpr std::string_view crBits[] = { "lt", "gt", "eq", "so" };
++    auto crBit = [&](uint32_t bi) { return fmt::format("{}.{}", cr(bi / 4), crBits[bi % 4]); };
++    auto printBranchIf = [&](const std::string& condition, uint32_t target)
++        {
++            if (target < fn.base || target >= fn.base + fn.size)
++            {
++                println("\tif ({}) {{", condition);
++                print("\t");
++                printFunctionCall(target);
++                println("\t\treturn;");
++                println("\t}}");
++            }
++            else
++            {
++                println("\tif ({}) goto loc_{:X};", condition, target);
++            }
++        };
++    auto printUpdateIndexed = [&](const char* load, const char* store, const char* reg)
++        {
++            // X-form update loads/stores: ea = rA + rB, then rA = ea.
++            println("\t{} = {}.u32 + {}.u32;", ea(), r(insn.operands[1]), r(insn.operands[2]));
++            if (load)
++                println("\t{}.u64 = {}({});", r(insn.operands[0]), load, ea());
++            else
++                println("\t{}({}, {}.{});", store, ea(), r(insn.operands[0]), reg);
++            println("\t{}.u32 = {};", r(insn.operands[1]), ea());
++        };
++
+     switch (id)
+     {
++    // ---- Skate 3 Native additions: integer ----
++
++    case PPC_INST_ADDC:
++        println("\t{}.ca = {}.u32 + {}.u32 < {}.u32;", xer(), r(insn.operands[1]), r(insn.operands[2]), r(insn.operands[1]));
++        println("\t{}.u64 = {}.u64 + {}.u64;", r(insn.operands[0]), r(insn.operands[1]), r(insn.operands[2]));
++        if (strchr(insn.opcode->name, '.'))
++            println("\t{}.compare<int32_t>({}.s32, 0, {});", cr(0), r(insn.operands[0]), xer());
++        break;
++
++    case PPC_INST_ADDME:
++        // rD = rA + CA - 1; the carry out of the 32-bit sum is set unless rA and CA are both 0.
++        println("\t{}.s64 = {}.s64 + {}.ca - 1;", temp(), r(insn.operands[1]), xer());
++        println("\t{}.ca = ({}.u32 != 0) | {}.ca;", xer(), r(insn.operands[1]), xer());
++        println("\t{}.s64 = {}.s64;", r(insn.operands[0]), temp());
++        if (strchr(insn.opcode->name, '.'))
++            println("\t{}.compare<int32_t>({}.s32, 0, {});", cr(0), r(insn.operands[0]), xer());
++        break;
++
++    case PPC_INST_SUBFZE:
++        // rD = ~rA + CA; carries only when ~rA is all ones and CA is set.
++        println("\t{}.s64 = ~{}.s64 + {}.ca;", temp(), r(insn.operands[1]), xer());
++        println("\t{}.ca = {}.u32 < ~{}.u32;", xer(), temp(), r(insn.operands[1]));
++        println("\t{}.s64 = {}.s64;", r(insn.operands[0]), temp());
++        if (strchr(insn.opcode->name, '.'))
++            println("\t{}.compare<int32_t>({}.s32, 0, {});", cr(0), r(insn.operands[0]), xer());
++        break;
++
++    case PPC_INST_EQV:
++        println("\t{}.u64 = ~({}.u64 ^ {}.u64);", r(insn.operands[0]), r(insn.operands[1]), r(insn.operands[2]));
++        if (strchr(insn.opcode->name, '.'))
++            println("\t{}.compare<int32_t>({}.s32, 0, {});", cr(0), r(insn.operands[0]), xer());
++        break;
++
++    case PPC_INST_MULHD:
++        println("\t{}.s64 = int64_t((static_cast<__int128>({}.s64) * static_cast<__int128>({}.s64)) >> 64);", r(insn.operands[0]), r(insn.operands[1]), r(insn.operands[2]));
++        if (strchr(insn.opcode->name, '.'))
++            println("\t{}.compare<int64_t>({}.s64, 0, {});", cr(0), r(insn.operands[0]), xer());
++        break;
++
++    case PPC_INST_MULHDU:
++        println("\t{}.u64 = uint64_t((static_cast<unsigned __int128>({}.u64) * static_cast<unsigned __int128>({}.u64)) >> 64);", r(insn.operands[0]), r(insn.operands[1]), r(insn.operands[2]));
++        if (strchr(insn.opcode->name, '.'))
++            println("\t{}.compare<int64_t>({}.s64, 0, {});", cr(0), r(insn.operands[0]), xer());
++        break;
++
++    // ---- Skate 3 Native additions: update-form loads and stores (D-form: rD, d, rA) ----
++
++    case PPC_INST_LHZU:
++        println("\t{} = {} + {}.u32;", ea(), int32_t(insn.operands[1]), r(insn.operands[2]));
++        println("\t{}.u64 = PPC_LOAD_U16({});", r(insn.operands[0]), ea());
++        println("\t{}.u32 = {};", r(insn.operands[2]), ea());
++        break;
++
++    case PPC_INST_LHAU:
++        println("\t{} = {} + {}.u32;", ea(), int32_t(insn.operands[1]), r(insn.operands[2]));
++        println("\t{}.s64 = int16_t(PPC_LOAD_U16({}));", r(insn.operands[0]), ea());
++        println("\t{}.u32 = {};", r(insn.operands[2]), ea());
++        break;
++
++    case PPC_INST_STHU:
++        println("\t{} = {} + {}.u32;", ea(), int32_t(insn.operands[1]), r(insn.operands[2]));
++        println("\tPPC_STORE_U16({}, {}.u16);", ea(), r(insn.operands[0]));
++        println("\t{}.u32 = {};", r(insn.operands[2]), ea());
++        break;
++
++    case PPC_INST_LFSU:
++        printSetFlushMode(false);
++        println("\t{} = {} + {}.u32;", ea(), int32_t(insn.operands[1]), r(insn.operands[2]));
++        println("\t{}.u32 = PPC_LOAD_U32({});", temp(), ea());
++        println("\t{}.f64 = double({}.f32);", f(insn.operands[0]), temp());
++        println("\t{}.u32 = {};", r(insn.operands[2]), ea());
++        break;
++
++    case PPC_INST_LFDU:
++        printSetFlushMode(false);
++        println("\t{} = {} + {}.u32;", ea(), int32_t(insn.operands[1]), r(insn.operands[2]));
++        println("\t{}.u64 = PPC_LOAD_U64({});", f(insn.operands[0]), ea());
++        println("\t{}.u32 = {};", r(insn.operands[2]), ea());
++        break;
++
++    case PPC_INST_STFSU:
++        printSetFlushMode(false);
++        println("\t{}.f32 = float({}.f64);", temp(), f(insn.operands[0]));
++        println("\t{} = {} + {}.u32;", ea(), int32_t(insn.operands[1]), r(insn.operands[2]));
++        println("\tPPC_STORE_U32({}, {}.u32);", ea(), temp());
++        println("\t{}.u32 = {};", r(insn.operands[2]), ea());
++        break;
++
++    case PPC_INST_STFDU:
++        printSetFlushMode(false);
++        println("\t{} = {} + {}.u32;", ea(), int32_t(insn.operands[1]), r(insn.operands[2]));
++        println("\tPPC_STORE_U64({}, {}.u64);", ea(), f(insn.operands[0]));
++        println("\t{}.u32 = {};", r(insn.operands[2]), ea());
++        break;
++
++    // ---- Skate 3 Native additions: update-form indexed loads and stores (X-form: rD, rA, rB) ----
++
++    case PPC_INST_LBZUX: printUpdateIndexed("PPC_LOAD_U8", nullptr, nullptr); break;
++    case PPC_INST_LHZUX: printUpdateIndexed("PPC_LOAD_U16", nullptr, nullptr); break;
++    case PPC_INST_LWZUX: printUpdateIndexed("PPC_LOAD_U32", nullptr, nullptr); break;
++    case PPC_INST_STBUX: printUpdateIndexed(nullptr, "PPC_STORE_U8", "u8"); break;
++    case PPC_INST_STHUX: printUpdateIndexed(nullptr, "PPC_STORE_U16", "u16"); break;
++    case PPC_INST_STDUX: printUpdateIndexed(nullptr, "PPC_STORE_U64", "u64"); break;
++
++    case PPC_INST_LFSUX:
++        printSetFlushMode(false);
++        println("\t{} = {}.u32 + {}.u32;", ea(), r(insn.operands[1]), r(insn.operands[2]));
++        println("\t{}.u32 = PPC_LOAD_U32({});", temp(), ea());
++        println("\t{}.f64 = double({}.f32);", f(insn.operands[0]), temp());
++        println("\t{}.u32 = {};", r(insn.operands[1]), ea());
++        break;
++
++    case PPC_INST_STFSUX:
++        printSetFlushMode(false);
++        println("\t{}.f32 = float({}.f64);", temp(), f(insn.operands[0]));
++        println("\t{} = {}.u32 + {}.u32;", ea(), r(insn.operands[1]), r(insn.operands[2]));
++        println("\tPPC_STORE_U32({}, {}.u32);", ea(), temp());
++        println("\t{}.u32 = {};", r(insn.operands[1]), ea());
++        break;
++
++    // ---- Skate 3 Native additions: vector ----
++    // Vectors are stored byte-reversed: host element i is guest element (N-1-i). Lane-wise
++    // ops are unaffected; two-source packs take vB's elements into the host's low half.
++
++    case PPC_INST_VNOR:
++    case PPC_INST_VNOR128:
++        println("\tsimde_mm_store_si128((simde__m128i*){}.u8, simde_mm_xor_si128(simde_mm_or_si128(simde_mm_load_si128((simde__m128i*){}.u8), simde_mm_load_si128((simde__m128i*){}.u8)), simde_mm_set1_epi32(-1)));", v(insn.operands[0]), v(insn.operands[1]), v(insn.operands[2]));
++        break;
++
++    case PPC_INST_VSUBUBM:
++        println("\tsimde_mm_store_si128((simde__m128i*){}.u8, simde_mm_sub_epi8(simde_mm_load_si128((simde__m128i*){}.u8), simde_mm_load_si128((simde__m128i*){}.u8)));", v(insn.operands[0]), v(insn.operands[1]), v(insn.operands[2]));
++        break;
++
++    case PPC_INST_VSUBUWM:
++        println("\tsimde_mm_store_si128((simde__m128i*){}.u32, simde_mm_sub_epi32(simde_mm_load_si128((simde__m128i*){}.u32), simde_mm_load_si128((simde__m128i*){}.u32)));", v(insn.operands[0]), v(insn.operands[1]), v(insn.operands[2]));
++        break;
++
++    case PPC_INST_VADDSWS:
++        for (size_t i = 0; i < 4; i++)
++        {
++            println("\t{}.s64 = int64_t({}.s32[{}]) + int64_t({}.s32[{}]);", temp(), v(insn.operands[1]), i, v(insn.operands[2]), i);
++            println("\t{}.s32[{}] = {}.s64 > INT_MAX ? INT_MAX : {}.s64 < INT_MIN ? INT_MIN : {}.s64;", v(insn.operands[0]), i, temp(), temp(), temp());
++        }
++        break;
++
++    case PPC_INST_VCMPGTUW:
++        println("\tsimde_mm_store_si128((simde__m128i*){}.u32, simde_mm_cmpgt_epu32(simde_mm_load_si128((simde__m128i*){}.u32), simde_mm_load_si128((simde__m128i*){}.u32)));", v(insn.operands[0]), v(insn.operands[1]), v(insn.operands[2]));
++        if (strchr(insn.opcode->name, '.'))
++            println("\t{}.setFromMask(simde_mm_load_ps({}.f32), 0xF);", cr(6), v(insn.operands[0]));
++        break;
++
++    case PPC_INST_VRLW:
++    case PPC_INST_VRLW128:
++        for (size_t i = 0; i < 4; i++)
++            println("\t{}.u32[{}] = __builtin_rotateleft32({}.u32[{}], {}.u8[{}] & 0x1F);", v(insn.operands[0]), i, v(insn.operands[1]), i, v(insn.operands[2]), i * 4);
++        break;
++
++    case PPC_INST_VSL:
++        println("\tsimde_mm_store_si128((simde__m128i*){}.u8, simde_mm_vsl(simde_mm_load_si128((simde__m128i*){}.u8), simde_mm_load_si128((simde__m128i*){}.u8)));", v(insn.operands[0]), v(insn.operands[1]), v(insn.operands[2]));
++        break;
++
++    case PPC_INST_VSPLTISH:
++        println("\tsimde_mm_store_si128((simde__m128i*){}.u16, simde_mm_set1_epi16(short(0x{:X})));", v(insn.operands[0]), insn.operands[1]);
++        break;
++
++    case PPC_INST_VCTUXS:
++    case PPC_INST_VCFPUXWS128:
++        printSetFlushMode(true);
++        print("\tsimde_mm_store_si128((simde__m128i*){}.u32, simde_mm_vctuxs(", v(insn.operands[0]));
++        if (insn.operands[2] != 0)
++            println("simde_mm_mul_ps(simde_mm_load_ps({}.f32), simde_mm_set1_ps({}))));", v(insn.operands[1]), 1u << insn.operands[2]);
++        else
++            println("simde_mm_load_ps({}.f32)));", v(insn.operands[1]));
++        break;
++
++    case PPC_INST_VPKSWSS:
++    case PPC_INST_VPKSWSS128:
++        println("\tsimde_mm_store_si128((simde__m128i*){}.s16, simde_mm_packs_epi32(simde_mm_load_si128((simde__m128i*){}.s32), simde_mm_load_si128((simde__m128i*){}.s32)));", v(insn.operands[0]), v(insn.operands[2]), v(insn.operands[1]));
++        break;
++
++    case PPC_INST_VPKUWUM:
++    case PPC_INST_VPKUWUM128:
++        for (size_t i = 0; i < 4; i++)
++        {
++            println("\t{}.u16[{}] = uint16_t({}.u32[{}]);", vTemp(), i, v(insn.operands[2]), i);
++            println("\t{}.u16[{}] = uint16_t({}.u32[{}]);", vTemp(), i + 4, v(insn.operands[1]), i);
++        }
++        println("\t{} = {};", v(insn.operands[0]), vTemp());
++        break;
++
++    case PPC_INST_VPKUWUS:
++    case PPC_INST_VPKUWUS128:
++        // Unsigned saturation: packus_epi32 would treat words >= 2^31 as negative.
++        for (size_t i = 0; i < 4; i++)
++        {
++            println("\t{}.u16[{}] = {}.u32[{}] > 0xFFFF ? 0xFFFF : uint16_t({}.u32[{}]);", vTemp(), i, v(insn.operands[2]), i, v(insn.operands[2]), i);
++            println("\t{}.u16[{}] = {}.u32[{}] > 0xFFFF ? 0xFFFF : uint16_t({}.u32[{}]);", vTemp(), i + 4, v(insn.operands[1]), i, v(insn.operands[1]), i);
++        }
++        println("\t{} = {};", v(insn.operands[0]), vTemp());
++        break;
++
++    case PPC_INST_VPKUHUM:
++    case PPC_INST_VPKUHUM128:
++        for (size_t i = 0; i < 8; i++)
++        {
++            println("\t{}.u8[{}] = uint8_t({}.u16[{}]);", vTemp(), i, v(insn.operands[2]), i);
++            println("\t{}.u8[{}] = uint8_t({}.u16[{}]);", vTemp(), i + 8, v(insn.operands[1]), i);
++        }
++        println("\t{} = {};", v(insn.operands[0]), vTemp());
++        break;
++
++    // ---- end of Skate 3 Native additions ----
++
+     case PPC_INST_ADD:
+         println("\t{}.u64 = {}.u64 + {}.u64;", r(insn.operands[0]), r(insn.operands[1]), r(insn.operands[2]));
+         if (strchr(insn.opcode->name, '.'))
+@@ -609,7 +852,8 @@ bool Recompiler::Recompile(
+     case PPC_INST_BCTR:
+         if (switchTable != config.switchTables.end())
+         {
+-            println("\tswitch ({}.u64) {{", r(switchTable->second.r));
++            // The guest's bounds check (cmplwi) only looks at the low 32 bits.
++            println("\tswitch ({}.u32) {{", r(switchTable->second.r));
+ 
+             for (size_t i = 0; i < switchTable->second.labels.size(); i++)
+             {
+@@ -663,9 +907,19 @@ bool Recompiler::Recompile(
+         break;
+ 
+     case PPC_INST_BDNZF:
+-        // NOTE: assuming eq here as a shortcut because all the instructions in the game do that
+         println("\t--{}.u64;", ctr());
+-        println("\tif ({}.u32 != 0 && !{}.eq) goto loc_{:X};", ctr(), cr(insn.operands[0] / 4), insn.operands[1]);
++        printBranchIf(fmt::format("{}.u32 != 0 && !{}", ctr(), crBit(insn.operands[0])), insn.operands[1]);
++        break;
++
++    case PPC_INST_BDNZT:
++        println("\t--{}.u64;", ctr());
++        printBranchIf(fmt::format("{}.u32 != 0 && {}", ctr(), crBit(insn.operands[0])), insn.operands[1]);
++        break;
++
++    case PPC_INST_BDZF:
++        // Used by Skate 3's compiler for dense switches: mtctr idx; bdzf; bdzf; ...
++        println("\t--{}.u64;", ctr());
++        printBranchIf(fmt::format("{}.u32 == 0 && !{}", ctr(), crBit(insn.operands[0])), insn.operands[1]);
+         break;
+ 
+     case PPC_INST_BEQ:
+@@ -1133,6 +1387,7 @@ bool Recompiler::Recompile(
+         println("\t{}.s64 = {};", r(insn.operands[0]), int32_t(insn.operands[1] << 16));
+         break;
+ 
++    case PPC_INST_LVEHX: // loading the aligned quadword puts the element where lvehx would
+     case PPC_INST_LVEWX:
+     case PPC_INST_LVEWX128:
+     case PPC_INST_LVX:
+@@ -1831,7 +2086,16 @@ bool Recompiler::Recompile(
+ 
+     case PPC_INST_VCMPBFP:
+     case PPC_INST_VCMPBFP128:
+-        println("\t__builtin_debugtrap();");
++        printSetFlushMode(true);
++        println("\tsimde_mm_store_si128((simde__m128i*){}.u32, simde_mm_vcmpbfp(simde_mm_load_ps({}.f32), simde_mm_load_ps({}.f32)));", v(insn.operands[0]), v(insn.operands[1]), v(insn.operands[2]));
++        if (strchr(insn.opcode->name, '.'))
++        {
++            // CR6 = 0b0010 when every element is within bounds, else 0.
++            println("\t{}.lt = 0;", cr(6));
++            println("\t{}.gt = 0;", cr(6));
++            println("\t{}.eq = simde_mm_testz_si128(simde_mm_load_si128((simde__m128i*){}.u32), simde_mm_load_si128((simde__m128i*){}.u32));", cr(6), v(insn.operands[0]), v(insn.operands[0]));
++            println("\t{}.so = 0;", cr(6));
++        }
+         break;
+ 
+     case PPC_INST_VCMPEQFP:
+@@ -2088,6 +2352,7 @@ bool Recompiler::Recompile(
+         break;
+ 
+     case PPC_INST_VSEL:
++    case PPC_INST_VSEL128: // the mask operand (VS128) is the destination register
+         println("\tsimde_mm_store_si128((simde__m128i*){}.u8, simde_mm_or_si128(simde_mm_andnot_si128(simde_mm_load_si128((simde__m128i*){}.u8), simde_mm_load_si128((simde__m128i*){}.u8)), simde_mm_and_si128(simde_mm_load_si128((simde__m128i*){}.u8), simde_mm_load_si128((simde__m128i*){}.u8))));", v(insn.operands[0]), v(insn.operands[3]), v(insn.operands[1]), v(insn.operands[3]), v(insn.operands[2]));
+         break;
+ 
+@@ -2430,6 +2695,8 @@ bool Recompiler::Recompile(const Function& fn)
+             if (!Recompile(fn, base, insn, data, switchTable, localVariables, csrState))
+             {
+                 fmt::println("Unrecognized instruction at 0x{:X}: {}", base, insn.opcode->name);
++                // Skate 3 Native: fail loudly instead of silently skipping the instruction.
++                println("\t__builtin_debugtrap();");
+                 allRecompiled = false;
+             }
+         }
+diff --git a/XenonUtils/ppc_context.h b/XenonUtils/ppc_context.h
+index 31a86cd..654655f 100644
+--- a/XenonUtils/ppc_context.h
++++ b/XenonUtils/ppc_context.h
+@@ -688,6 +688,43 @@ inline simde__m128i simde_mm_vsr(simde__m128i a, simde__m128i b)
+     return simde_mm_castps_si128(simde_mm_insert_ps(simde_mm_castsi128_ps(simde_mm_srl_epi64(a, b)), simde_mm_castsi128_ps(simde_mm_srl_epi64(simde_mm_srli_si128(a, 4), b)), 0x10));
+ }
+ 
++// Skate 3 Native additions.
++
++inline simde__m128i simde_mm_cmpgt_epu32(simde__m128i a, simde__m128i b)
++{
++    simde__m128i c = simde_mm_set1_epi32(INT_MIN);
++    return simde_mm_cmpgt_epi32(simde_mm_xor_si128(a, c), simde_mm_xor_si128(b, c));
++}
++
++// vsl: shift the whole 128-bit register left by 0-7 bits. The vector is stored byte-reversed,
++// so the host's little-endian 128-bit value equals the guest's big-endian one. Element 2 needs
++// the bits that cross the 64-bit lane boundary, taken from a copy shifted up by one element.
++inline simde__m128i simde_mm_vsl(simde__m128i a, simde__m128i b)
++{
++    b = simde_mm_srli_epi64(simde_mm_slli_epi64(b, 61), 61);
++    return simde_mm_castps_si128(simde_mm_insert_ps(simde_mm_castsi128_ps(simde_mm_sll_epi64(a, b)), simde_mm_castsi128_ps(simde_mm_sll_epi64(simde_mm_slli_si128(a, 4), b)), 0xE0));
++}
++
++// vctuxs / vcfpuxws128: float to unsigned word, saturating. NaN and negatives give 0,
++// values of 2^32 and up give 0xFFFFFFFF, everything else truncates toward zero.
++inline simde__m128i simde_mm_vctuxs(simde__m128 src)
++{
++    simde__m128 clamped = simde_mm_max_ps(src, simde_mm_setzero_ps()); // maxps returns 0 for NaN
++    simde__m128 two31 = simde_mm_set1_ps(2147483648.0f);
++    simde__m128i low = simde_mm_cvttps_epi32(clamped);
++    simde__m128i high = simde_mm_add_epi32(simde_mm_cvttps_epi32(simde_mm_sub_ps(clamped, two31)), simde_mm_set1_epi32(INT_MIN));
++    simde__m128i value = simde_mm_blendv_epi8(low, high, simde_mm_castps_si128(simde_mm_cmpge_ps(clamped, two31)));
++    return simde_mm_or_si128(value, simde_mm_castps_si128(simde_mm_cmpge_ps(clamped, simde_mm_set1_ps(4294967296.0f))));
++}
++
++// vcmpbfp: bit 31 is set where a <= b fails, bit 30 where a >= -b fails (NaN fails both).
++inline simde__m128i simde_mm_vcmpbfp(simde__m128 a, simde__m128 b)
++{
++    simde__m128i le = simde_mm_castps_si128(simde_mm_cmple_ps(a, b));
++    simde__m128i ge = simde_mm_castps_si128(simde_mm_cmpge_ps(a, simde_mm_xor_ps(b, simde_mm_set1_ps(-0.0f))));
++    return simde_mm_or_si128(simde_mm_andnot_si128(le, simde_mm_set1_epi32(INT_MIN)), simde_mm_andnot_si128(ge, simde_mm_set1_epi32(0x40000000)));
++}
++
+ #if defined(__aarch64__) || defined(_M_ARM64)
+ inline uint64_t __rdtsc()
+ {

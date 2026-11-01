@@ -1,0 +1,37 @@
+# XenonRecomp configuration for Skate 3 (title 454108E6, disc version 0.0.0.3,
+# media ID 5C087C2C, default.xex sha1 2f1e63fbdfc90a30381328c428437747ee91295b).
+#
+# scripts/recomp.ps1 copies this file into the work folder
+# (%LOCALAPPDATA%\Skate3Native\recomp) and runs XenonRecomp there, so the paths
+# below are relative to that folder, not to this repository.
+
+[main]
+file_path = "../game/default.xex"
+out_directory_path = "out"
+switch_table_file_path = "skate3_switch_tables.toml"
+
+# Optimizations stay off until the recompiled game runs correctly.
+skip_lr = false
+skip_msr = false
+ctr_as_local = false
+xer_as_local = false
+reserved_as_local = false
+cr_as_local = false
+non_argument_as_local = false
+non_volatile_as_local = false
+
+# Register save/restore helpers, found by recomp/tools/xexscan. Each pattern
+# matches exactly once; the counts are branches landing inside the helper.
+restgprlr_14_address = 0x82F274E0  # 29193 branches
+savegprlr_14_address = 0x82F27490  # 17425 branches
+restfpr_14_address = 0x82F2845C    # 661 branches
+savefpr_14_address = 0x82F28410    # 471 branches
+restvmx_14_address = 0x82F2C4A8    # unused: the game only saves v64-v127
+savevmx_14_address = 0x82F2C210    # unused
+restvmx_64_address = 0x82F2C53C    # 301 branches
+savevmx_64_address = 0x82F2C2A4    # 258 branches
+
+# setjmp stores f14-f31 and r13-r31 into the buffer at r3 (r14 at offset 160).
+# longjmp reloads r14/r15 from those same slots and calls RtlUnwind.
+setjmp_address = 0x82F44E40
+longjmp_address = 0x82F25260

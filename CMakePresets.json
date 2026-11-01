@@ -1,0 +1,17 @@
+{
+  "version": 6,
+  "configurePresets": [
+    {
+      "name": "windows",
+      "displayName": "Windows x64 (clang-cl)",
+      "generator": "Visual Studio 17 2022",
+      "architecture": "x64",
+      "toolset": "ClangCL",
+      "binaryDir": "${sourceDir}/build"
+    }
+  ],
+  "buildPresets": [
+    { "name": "release", "configurePreset": "windows", "configuration": "Release" },
+    { "name": "debug", "configurePreset": "windows", "configuration": "Debug" }
+  ]
+}

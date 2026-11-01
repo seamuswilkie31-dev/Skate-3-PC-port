@@ -1,0 +1,160 @@
+diff --git a/XenonRecomp/recompiler.cpp b/XenonRecomp/recompiler.cpp
+index 4c9e541..2faba48 100644
+--- a/XenonRecomp/recompiler.cpp
++++ b/XenonRecomp/recompiler.cpp
+@@ -966,7 +966,16 @@ bool Recompiler::Recompile(
+         break;
+ 
+     case PPC_INST_BLRL:
+-        println("__builtin_debugtrap();");
++        // Skate 3 Native: call through LR, which then points back here.
++        if (config.skipLr)
++        {
++            println("\t__builtin_debugtrap(); // blrl needs the link register (skip_lr is on)");
++            break;
++        }
++        println("\t{}.u64 = ctx.lr;", temp());
++        println("\tctx.lr = 0x{:X};", base + 4);
++        println("\tPPC_CALL_INDIRECT_FUNC({}.u32);", temp());
++        csrState = CSRState::Unknown; // the call could change it
+         break;
+ 
+     case PPC_INST_BLT:
+@@ -2278,27 +2287,46 @@ bool Recompiler::Recompile(
+             println("\t{}.u32[{}] = {}.u32;", v(insn.operands[0]), insn.operands[4], temp());
+             break;
+ 
++        case 3: // float16_2
+         case 5: // float16_4
+-            if (insn.operands[3] != 2 || insn.operands[4] > 2)
+-                fmt::println("Unexpected float16_4 pack instruction at {:X}", base);
++        {
++            // Skate 3 Native: every pack mode and shift. The halves are packed into guest words
++            // 3 (float16_2: x:y) or 2-3 (float16_4: x:y, z:w); the pack mode and shift then
++            // choose which destination words receive packed words (-1 keeps the old word).
++            constexpr int placement[4][4][4] = {
++                {},
++                { { -1, -1, -1, 3 }, { -1, -1, 3, -1 }, { -1, 3, -1, -1 }, { 3, -1, -1, -1 } },
++                { { -1, -1, 2, 3 }, { -1, 2, 3, -1 }, { 2, 3, -1, -1 }, { 3, -1, -1, -1 } },
++                { { -1, -1, 2, 3 }, { -1, 2, 3, -1 }, { 2, 3, -1, -1 }, { -1, -1, -1, 2 } },
++            };
++            const uint32_t pack = insn.operands[3];
++            const uint32_t shift = insn.operands[4];
++            if (pack == 0 || pack > 3 || shift > 3)
++            {
++                fmt::println("Unexpected float16 pack mode {} shift {} at {:X}", pack, shift, base);
++                println("\t__builtin_debugtrap();");
++                break;
++            }
+ 
+-            for (size_t i = 0; i < 4; i++)
++            // Guest element e is host lane 3 - e, and guest word k is host word 3 - k.
++            println("\t{}.u64[0] = 0;", vTemp());
++            println("\t{}.u64[1] = 0;", vTemp());
++            if (insn.operands[2] == 3)
++            {
++                println("\t{}.u32[0] = (uint32_t(ppc_pack_half({}.u32[3])) << 16) | ppc_pack_half({}.u32[2]);", vTemp(), v(insn.operands[1]), v(insn.operands[1]));
++            }
++            else
+             {
+-        		// Strip sign from source
+-        		println("\t{}.u32 = ({}.u32[{}]&0x7FFFFFFF);", temp(), v(insn.operands[1]), i);
+-        		// If |source| is > 65504, clamp output to 0x7FFF, else save 8 exponent bits 
+-        		println("\t{0}.u8[0] = ({1}.f32 != {1}.f32) || ({1}.f32 > 65504.0f) ? 0xFF : (({2}.u32[{3}]&0x7f800000)>>23);", vTemp(), temp(), v(insn.operands[1]), i);
+-        		// If 8 exponent bits were saved, it can only be 0x8E at most
+-        		// If saved, save first 10 bits of mantissa
+-        		println("\t{}.u16 = {}.u8[0] != 0xFF ? (({}.u32[{}]&0x7FE000)>>13) : 0x0;", temp(), vTemp(), v(insn.operands[1]), i);
+-        		// If saved and > 127-15, exponent is converted from 8 to 5-bit by subtracting 0x70
+-        		// If saved but not > 127-15, clamp exponent at 0, add 0x400 to mantissa and shift right by (0x71-exponent)
+-        		// If right shift is greater than 31 bits, manually clamp mantissa to 0 or else the output of the shift will be wrong
+-        		println("\t{0}.u16[{1}] = {2}.u8[0] != 0xFF ? ({2}.u8[0] > 0x70 ? ((({2}.u8[0]-0x70)<<10)+{3}.u16) : (0x71-{2}.u8[0] > 31 ? 0x0 : ((0x400+{3}.u16)>>(0x71-{2}.u8[0])))) : 0x7FFF;", v(insn.operands[0]), i+(2*insn.operands[4]), vTemp(), temp());
+-        		// Add back original sign
+-        		println("\t{}.u16[{}] |= (({}.u32[{}]&0x80000000)>>16);", v(insn.operands[0]), i+(2*insn.operands[4]), v(insn.operands[1]), i);
++                println("\t{}.u32[1] = (uint32_t(ppc_pack_half({}.u32[3])) << 16) | ppc_pack_half({}.u32[2]);", vTemp(), v(insn.operands[1]), v(insn.operands[1]));
++                println("\t{}.u32[0] = (uint32_t(ppc_pack_half({}.u32[1])) << 16) | ppc_pack_half({}.u32[0]);", vTemp(), v(insn.operands[1]), v(insn.operands[1]));
++            }
++            for (int k = 0; k < 4; k++)
++            {
++                if (placement[pack][shift][k] >= 0)
++                    println("\t{}.u32[{}] = {}.u32[{}];", v(insn.operands[0]), 3 - k, vTemp(), 3 - placement[pack][shift][k]);
+             }
+             break;
++        }
+ 
+         default:
+             println("\t__builtin_debugtrap();");
+@@ -2477,6 +2505,20 @@ bool Recompiler::Recompile(
+             println("\t{} = {};", v(insn.operands[0]), vTemp());
+             break;
+ 
++        case 3: // Skate 3 Native: float16_2 -> (x, y, 0, 1), x and y from guest halfwords 6 and 7
++            println("\t{}.f32[3] = ppc_unpack_half({}.u16[1]);", vTemp(), v(insn.operands[1]));
++            println("\t{}.f32[2] = ppc_unpack_half({}.u16[0]);", vTemp(), v(insn.operands[1]));
++            println("\t{}.f32[1] = 0.0f;", vTemp());
++            println("\t{}.f32[0] = 1.0f;", vTemp());
++            println("\t{} = {};", v(insn.operands[0]), vTemp());
++            break;
++
++        case 5: // Skate 3 Native: float16_4 -> (x, y, z, w) from guest halfwords 4-7
++            for (size_t i = 0; i < 4; i++)
++                println("\t{}.f32[{}] = ppc_unpack_half({}.u16[{}]);", vTemp(), i, v(insn.operands[1]), i);
++            println("\t{} = {};", v(insn.operands[0]), vTemp());
++            break;
++
+         default:
+             println("\t__builtin_debugtrap();");
+             break;
+diff --git a/XenonUtils/ppc_context.h b/XenonUtils/ppc_context.h
+index 654655f..7434cad 100644
+--- a/XenonUtils/ppc_context.h
++++ b/XenonUtils/ppc_context.h
+@@ -717,6 +717,49 @@ inline simde__m128i simde_mm_vctuxs(simde__m128 src)
+     return simde_mm_or_si128(value, simde_mm_castps_si128(simde_mm_cmpge_ps(clamped, simde_mm_set1_ps(4294967296.0f))));
+ }
+ 
++// Xbox 360 half floats (VMX128 D3D packs, Xenos vertex formats) have no INF or NaN:
++// exponent 31 is an ordinary exponent. Packing truncates toward zero; NaN and magnitudes
++// above 65504 saturate to 0x7FFF with the sign kept (as XenonRecomp's float16_4 pack did).
++inline uint16_t ppc_pack_half(uint32_t bits)
++{
++    uint32_t sign = (bits >> 16) & 0x8000;
++    uint32_t magnitude = bits & 0x7FFFFFFF;
++    float value = __builtin_bit_cast(float, magnitude);
++    if (value != value || value > 65504.0f)
++        return uint16_t(sign | 0x7FFF);
++
++    uint32_t exponent = magnitude >> 23;
++    uint32_t mantissa = (magnitude >> 13) & 0x3FF;
++    if (exponent > 112)
++        return uint16_t(sign | ((exponent - 112) << 10) | mantissa);
++
++    // Below 2^-14 the result is a half denormal: shift the implicit 1 down.
++    uint32_t shift = 113 - exponent;
++    return uint16_t(sign | (shift > 31 ? 0 : (0x400 | mantissa) >> shift));
++}
++
++inline float ppc_unpack_half(uint16_t half)
++{
++    uint32_t sign = uint32_t(half & 0x8000) << 16;
++    int32_t exponent = (half >> 10) & 0x1F;
++    uint32_t mantissa = half & 0x3FF;
++    if (exponent == 0)
++    {
++        if (mantissa == 0)
++            return __builtin_bit_cast(float, sign);
++
++        // Half denormals are normal floats: renormalize.
++        exponent = 1;
++        while (!(mantissa & 0x400))
++        {
++            mantissa <<= 1;
++            --exponent;
++        }
++        mantissa &= 0x3FF;
++    }
++    return __builtin_bit_cast(float, sign | (uint32_t(exponent + 112) << 23) | (mantissa << 13));
++}
++
+ // vcmpbfp: bit 31 is set where a <= b fails, bit 30 where a >= -b fails (NaN fails both).
+ inline simde__m128i simde_mm_vcmpbfp(simde__m128 a, simde__m128 b)
+ {

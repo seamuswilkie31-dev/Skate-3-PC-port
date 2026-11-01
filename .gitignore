@@ -1,0 +1,11 @@
+# Build output
+build/
+out/
+
+# Game files and anything derived from them: never commit these.
+game/
+*.iso
+*.xex
+*.xexp
+recomp/out/
+saves/
