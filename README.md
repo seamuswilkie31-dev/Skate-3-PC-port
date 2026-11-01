@@ -12,13 +12,14 @@ will be built, and the phase plan.
 
 ## Status
 
-Phase 3 in progress. Skate 3's recompiled code runs natively on 13 guest
+Phase 3 in progress. Skate 3's recompiled code runs natively on 14 guest
 threads (its loader, timer, file-system, network and job threads) with real
-waits, events, semaphores, mutexes, critical sections and timers. Start-up
-now gets as far as opening its first data files on the disc, which the
-runtime doesn't serve yet. No graphics, audio or input yet. See
-[docs/PHASE3.md](docs/PHASE3.md) for the details and what's next, and
-[docs/PHASE2.md](docs/PHASE2.md) for the recompilation work.
+waits, events, semaphores, mutexes, critical sections and timers, and reads
+its data from your ISO. Start-up loads its first archives, sets up Direct3D
+and stops at the GPU's registers, where the renderer work begins. No
+graphics, audio or input yet. See [docs/PHASE3.md](docs/PHASE3.md) for the
+details and what's next, and [docs/PHASE2.md](docs/PHASE2.md) for the
+recompilation work.
 
 | Piece | State |
 |---|---|
@@ -26,9 +27,9 @@ runtime doesn't serve yet. No graphics, audio or input yet. See
 | Launcher | Game check, display, controls (with live tester), save import, Radmin detection, modifiers |
 | `recomp/tools/xexscan` | Finds all 10 addresses XenonRecomp needs; resolves 375 jump tables (354 guarded, 21 unguarded) and 43 leaf-function boundaries; marks the end-of-.text data block as non-code; disassembles and searches code |
 | `scripts/recomp.ps1` | ISO → `default.xex` → xexscan → 219 MB of C++, in the work folder |
-| XenonRecomp patches | 39 missing instruction forms, D3D half-float packs, fixes; Skate 3 has 0 unrecognized instructions and 0 traps |
+| XenonRecomp patches | 39 missing instruction forms, D3D half-float packs, the console's 50 MHz timebase, fixes; Skate 3 has 0 unrecognized instructions and 0 traps |
 | `scripts/test_recomp.ps1` | 110 instruction tests (344 checks) against a Python reference model |
-| Runtime (`s3native.exe`) | Runs the game's start-up natively: guest memory, loader, guest threads on host threads, kernel objects and waits, critical sections, timers; 63 kernel functions implemented, logging stubs for the other 223 |
+| Runtime (`s3native.exe`) | Runs the game's start-up natively: guest memory, loader, guest threads on host threads, kernel objects and waits, critical sections, timers, files from the disc; 73 kernel functions implemented, logging stubs for the other 213 |
 
 ## Requirements
 
@@ -56,9 +57,11 @@ powershell -ExecutionPolicy Bypass -File scripts\build.ps1
    `%LOCALAPPDATA%\Skate3Native\build` (the generated code compiles in a few
    minutes on 8 parallel jobs; Visual Studio's generator works but is serial).
 5. `s3native.exe` runs the game and logs every kernel call to the console and
-   `%LOCALAPPDATA%\Skate3Native\s3native.log`. Options: `--xex <path>`,
-   `--log <file>`, `--stall <seconds>`, `--time-limit <seconds>`, and
-   `--watch <hex address>` to log every write to one guest word.
+   `%LOCALAPPDATA%\Skate3Native\s3native.log`. It reads game files from the
+   ISO or folder chosen in the launcher, or from `--game <path>`. Other
+   options: `--xex <path>`, `--log <file>`, `--stall <seconds>`,
+   `--time-limit <seconds>`, and `--watch <hex address>` to log every write
+   to one guest word.
 
 The launcher builds without any game files: `build.ps1 -Target s3launcher`.
 Settings live in `%APPDATA%\Skate3Native\config.ini`, saves in

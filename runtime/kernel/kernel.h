@@ -12,6 +12,7 @@
 #include <string>
 
 namespace s3n {
+class Disc;
 class GuestMemory;
 }
 
@@ -45,7 +46,20 @@ constexpr uint32_t kStatusNoMemory = 0xC0000017;
 constexpr uint32_t kStatusObjectTypeMismatch = 0xC0000024;
 constexpr uint32_t kStatusMutantNotOwned = 0xC0000046;
 constexpr uint32_t kStatusSemaphoreLimitExceeded = 0xC0000047;
+constexpr uint32_t kStatusNoMoreFiles = 0x80000006;
+constexpr uint32_t kStatusBufferOverflow = 0x80000005;
+constexpr uint32_t kStatusInvalidInfoClass = 0xC0000003;
+constexpr uint32_t kStatusInfoLengthMismatch = 0xC0000004;
+constexpr uint32_t kStatusAccessViolation = 0xC0000005;
+constexpr uint32_t kStatusNoSuchFile = 0xC000000F;
+constexpr uint32_t kStatusInvalidDeviceRequest = 0xC0000010;
+constexpr uint32_t kStatusEndOfFile = 0xC0000011;
 constexpr uint32_t kStatusObjectNameNotFound = 0xC0000034;
+constexpr uint32_t kStatusObjectNameCollision = 0xC0000035;
+constexpr uint32_t kStatusObjectPathNotFound = 0xC000003A;
+constexpr uint32_t kStatusMediaWriteProtected = 0xC00000A2;
+constexpr uint32_t kStatusFileIsADirectory = 0xC00000BA;
+constexpr uint32_t kStatusNotADirectory = 0xC0000103;
 
 // ---- Threads (threads.cpp) ----
 
@@ -103,14 +117,20 @@ enum ObjectType : uint8_t {
     kThreadObject = 6,
     kNotificationTimer = 8,
     kSynchronizationTimer = 9,
+    // The runtime's tag for file objects: waitable, and signaled while no I/O is pending
+    // (always, since I/O completes before the call returns).
+    kFileObject = 0x40,
 };
 
-// The ANSI name in an OBJECT_ATTRIBUTES (root directory, ANSI_STRING* name, attributes).
+// An ANSI_STRING (u16 length, u16 maximum length, char* buffer); "" for a null pointer.
+std::string AnsiString(const uint8_t* base, uint32_t string);
+// The name in an OBJECT_ATTRIBUTES (root directory, ANSI_STRING* name, attributes).
 std::string ObjectName(const uint8_t* base, uint32_t attributes);
 
 // A zeroed kernel object in system memory with one reference and its dispatcher header
-// set. Returns 0 when system memory is full.
-uint32_t NewObject(uint32_t size, uint8_t type, int32_t signalState);
+// set. `cleanup` runs when the last reference goes. Returns 0 when system memory is full.
+using ObjectCleanup = void (*)(uint32_t object);
+uint32_t NewObject(uint32_t size, uint8_t type, int32_t signalState, ObjectCleanup cleanup = nullptr);
 // References count only for objects from NewObject; others belong to the title.
 void ReferenceObject(uint32_t object);
 void DereferenceObject(uint32_t object);
@@ -135,6 +155,11 @@ using Deadline = std::optional<std::chrono::steady_clock::time_point>;
 // Returns STATUS_WAIT_0 + index, kStatusTimeout or kStatusUserApc.
 uint32_t WaitForObjects(PPCContext& ctx, uint8_t* base, const char* caller, const uint32_t* objects, uint32_t count,
                         bool waitAll, bool alertable, const Deadline& deadline);
+
+// ---- Files (file_imports.cpp) ----
+
+// The game disc, served as d:\, game:\ and \Device\Cdrom0.
+void MountDisc(const Disc* disc);
 
 // ---- Time (time.cpp) ----
 

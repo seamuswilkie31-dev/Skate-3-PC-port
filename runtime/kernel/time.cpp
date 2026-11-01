@@ -37,9 +37,13 @@ std::condition_variable gTimersWake;
 std::unordered_map<uint32_t, Timer> gTimers;  // armed timers by KTIMER address
 uint32_t gTimeStampBundle = 0;
 Clock::time_point gBoot;
-uint64_t gTscFrequency = 0;
 
-// mftb is recompiled as rdtsc, so the guest's performance counter runs at the TSC rate.
+// The guest's timebase (mftb, KeQueryPerformanceFrequency) runs at the console's 50 MHz.
+// Titles assume that rate in places, so the host's TSC is scaled to it: 32.32 fixed point.
+constexpr uint64_t kTimebaseFrequency = 50000000;
+uint64_t gTscStart = 0;
+uint64_t gTscToTimebase = 0;
+
 uint64_t MeasureTscFrequency() {
     LARGE_INTEGER frequency, start, now;
     QueryPerformanceFrequency(&frequency);
@@ -121,7 +125,10 @@ Deadline MillisecondTimeout(uint32_t milliseconds) {
 void StartClock() {
     timeBeginPeriod(1);  // millisecond sleeps and waits
     gBoot = Clock::now();
-    gTscFrequency = MeasureTscFrequency();
+    uint64_t tscFrequency = MeasureTscFrequency();
+    gTscToTimebase = (kTimebaseFrequency << 32) / tscFrequency;
+    gTscStart = __rdtsc();
+    Log("  timebase: host TSC %.3f GHz scaled to the console's 50 MHz\n", tscFrequency / 1e9);
     std::thread(ClockThread).detach();
 }
 
@@ -136,10 +143,16 @@ void SetTimeStampBundle(uint32_t address) {
 using namespace s3n;
 using namespace s3n::kernel;
 
+// mftb, as recompiled by our XenonRecomp patch 0003.
+extern "C" uint64_t PPCQueryTimebase() {
+    uint64_t high, low = _umul128(__rdtsc() - gTscStart, gTscToTimebase, &high);
+    return high << 32 | low >> 32;
+}
+
 // u64 KeQueryPerformanceFrequency()
 PPC_FUNC(__imp__KeQueryPerformanceFrequency) {
     Trace(ctx, "KeQueryPerformanceFrequency", true);
-    ctx.r3.u64 = gTscFrequency;
+    ctx.r3.u64 = kTimebaseFrequency;
 }
 
 // void KeQuerySystemTime(u64* time)
@@ -176,7 +189,11 @@ PPC_FUNC(__imp__NtSetTimerEx) {
     }
     SignalObject(timer, 0);
     Timer t;
-    t.due = DeadlineFor(int64_t(LoadBE64(base, ctx.r4.u32)));
+    int64_t dueTime = int64_t(LoadBE64(base, ctx.r4.u32));
+    static std::atomic<uint32_t> logged{0};
+    if (logged++ < 16)
+        Log("  t%u NtSetTimerEx: due %lld, period %d ms\n", CurrentThreadNumber(), dueTime, ctx.r9.s32);
+    t.due = DeadlineFor(dueTime);
     t.routine = ctx.r5.u32;
     t.arg = ctx.r7.u32;
     t.thread = CurrentThread();

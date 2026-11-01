@@ -1,0 +1,29 @@
+diff --git a/XenonRecomp/recompiler.cpp b/XenonRecomp/recompiler.cpp
+index 2faba48..0c120ee 100644
+--- a/XenonRecomp/recompiler.cpp
++++ b/XenonRecomp/recompiler.cpp
+@@ -1524,7 +1524,9 @@ bool Recompiler::Recompile(
+         break;
+ 
+     case PPC_INST_MFTB:
+-        println("\t{}.u64 = __rdtsc();", r(insn.operands[0]));
++        // Skate 3 Native: the console's timebase runs at 50 MHz and titles count on it;
++        // the runtime scales the host's counter to match.
++        println("\t{}.u64 = PPCQueryTimebase();", r(insn.operands[0]));
+         break;
+ 
+     case PPC_INST_MR:
+diff --git a/XenonUtils/ppc_context.h b/XenonUtils/ppc_context.h
+index 7434cad..4ed58d5 100644
+--- a/XenonUtils/ppc_context.h
++++ b/XenonUtils/ppc_context.h
+@@ -115,6 +115,9 @@
+ 
+ typedef void PPCFunc(struct PPCContext& __restrict__ ctx, uint8_t* base);
+ 
++// The timebase (mftb) at the console's 50 MHz, supplied by the runtime (Skate 3 Native).
++extern "C" uint64_t PPCQueryTimebase();
++
+ struct PPCFuncMapping
+ {
+     size_t guest;

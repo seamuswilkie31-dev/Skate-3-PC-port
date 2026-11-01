@@ -29,6 +29,8 @@ public:
     std::vector<Entry> List(const Entry& dir) { return ListDirectory(dir.sector, dir.size); }
     std::optional<Entry> Find(std::string_view path);  // case-insensitive, '/' or '\'
     bool Read(const Entry& file, uint64_t offset, void* dst, size_t size);
+    // Where a file's data starts in the image file.
+    uint64_t Offset(const Entry& file) const { return base_ + uint64_t(file.sector) * 2048; }
 
     // Calls visit(path, entry) for every file and directory, depth first.
     template <class F> void Walk(F&& visit) { WalkImpl(Root(), std::string(), visit, 0); }

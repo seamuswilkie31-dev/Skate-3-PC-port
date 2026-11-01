@@ -42,6 +42,7 @@ struct ObjectInfo {
     uint32_t refs = 0;
     uint32_t size = 0;
     std::string name;
+    ObjectCleanup cleanup = nullptr;
 };
 
 std::mutex gObjectsMutex;
@@ -156,9 +157,7 @@ uint32_t ObjectOfType(const uint8_t* base, uint32_t handle, std::initializer_lis
 
 }  // namespace
 
-std::string ObjectName(const uint8_t* base, uint32_t attributes) {
-    if (!attributes) return {};
-    uint32_t string = LoadBE32(base, attributes + 4);
+std::string AnsiString(const uint8_t* base, uint32_t string) {
     if (!string) return {};
     uint16_t length = uint16_t(base[string] << 8 | base[string + 1]);
     uint32_t buffer = LoadBE32(base, string + 4);
@@ -166,7 +165,11 @@ std::string ObjectName(const uint8_t* base, uint32_t attributes) {
     return std::string(reinterpret_cast<const char*>(base + buffer), length);
 }
 
-uint32_t NewObject(uint32_t size, uint8_t type, int32_t signalState) {
+std::string ObjectName(const uint8_t* base, uint32_t attributes) {
+    return attributes ? AnsiString(base, LoadBE32(base, attributes + 4)) : std::string();
+}
+
+uint32_t NewObject(uint32_t size, uint8_t type, int32_t signalState, ObjectCleanup cleanup) {
     uint8_t* base = Memory().base();
     size = PoolSize(size);
     uint32_t object = 0;
@@ -186,7 +189,7 @@ uint32_t NewObject(uint32_t size, uint8_t type, int32_t signalState) {
     StoreBE32(base, object + kHeaderWaitList, object + kHeaderWaitList);  // empty list: points at itself
     StoreBE32(base, object + kHeaderWaitList + 4, object + kHeaderWaitList);
     std::lock_guard lock(gObjectsMutex);
-    gObjects[object] = ObjectInfo{1, size, {}};
+    gObjects[object] = ObjectInfo{1, size, {}, cleanup};
     return object;
 }
 
@@ -196,12 +199,20 @@ void ReferenceObject(uint32_t object) {
 }
 
 void DereferenceObject(uint32_t object) {
+    ObjectCleanup cleanup;
+    uint32_t size;
+    {
+        std::lock_guard lock(gObjectsMutex);
+        auto it = gObjects.find(object);
+        if (it == gObjects.end() || --it->second.refs > 0) return;
+        if (!it->second.name.empty()) gNamedObjects.erase(it->second.name);
+        cleanup = it->second.cleanup;
+        size = it->second.size;
+        gObjects.erase(it);
+    }
+    if (cleanup) cleanup(object);  // outside the lock: it may close handles of its own
     std::lock_guard lock(gObjectsMutex);
-    auto it = gObjects.find(object);
-    if (it == gObjects.end() || --it->second.refs > 0) return;
-    if (!it->second.name.empty()) gNamedObjects.erase(it->second.name);
-    gFreeObjects[it->second.size].push_back(object);
-    gObjects.erase(it);
+    gFreeObjects[size].push_back(object);
 }
 
 uint32_t CreateHandle(uint32_t object) {

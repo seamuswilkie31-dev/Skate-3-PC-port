@@ -1,11 +1,15 @@
 // s3native: runs Skate 3's recompiled code natively.
 //
-//   s3native [--xex <default.xex>] [--log <file>] [--stall <seconds>] [--time-limit <seconds>]
+//   s3native [--game <iso or folder>] [--xex <default.xex>] [--log <file>]
+//            [--stall <seconds>] [--time-limit <seconds>] [--watch <hex address>]
 //
-// Loads the game, starts its entry point on a guest main thread, and logs every kernel
-// call. Guest threads run on host threads; imports we haven't implemented are logged
-// stubs returning 0. The run ends through kernel::Finish, which prints a report.
+// Loads the game, mounts its disc (--game, or the launcher's choice in config.ini),
+// starts its entry point on a guest main thread, and logs every kernel call. Guest
+// threads run on host threads; imports we haven't implemented are logged stubs
+// returning 0. The run ends through kernel::Finish, which prints a report.
 
+#include "config.h"
+#include "disc.h"
 #include "kernel/kernel.h"
 #include "loader.h"
 #include "memory.h"
@@ -30,10 +34,12 @@ std::string DefaultWorkPath(const char* leaf) {
 int main(int argc, char** argv) {
     std::string xexPath = DefaultWorkPath("game\\default.xex");
     std::string logPath = DefaultWorkPath("s3native.log");
+    std::string gameSource;
     kernel::Options options;
     for (int i = 1; i + 1 < argc; i += 2) {
         std::string key = argv[i];
-        if (key == "--xex") xexPath = argv[i + 1];
+        if (key == "--game") gameSource = argv[i + 1];
+        else if (key == "--xex") xexPath = argv[i + 1];
         else if (key == "--log") logPath = argv[i + 1];
         else if (key == "--stall") options.stallSeconds = uint32_t(std::atoi(argv[i + 1]));
         else if (key == "--time-limit") options.timeLimitSeconds = uint32_t(std::atoi(argv[i + 1]));
@@ -64,6 +70,24 @@ int main(int argc, char** argv) {
         kernel::DefineVariable(name, address);
     }
     kernel::Log("\n");
+
+    // The disc: --game, or the ISO/folder chosen in the launcher.
+    if (gameSource.empty()) {
+        Config config;
+        if (LoadConfig(ConfigPath(), config)) gameSource = config.game.source;
+    }
+    if (gameSource.empty()) {
+        kernel::Log("s3native: no game disc; choose your ISO in the launcher or pass --game <iso or folder>\n");
+        return 1;
+    }
+    static Disc disc;
+    if (!disc.Mount(PathFromUtf8(gameSource), error)) {
+        kernel::Log("s3native: can't mount %s: %s\n", gameSource.c_str(), error.c_str());
+        return 1;
+    }
+    kernel::MountDisc(&disc);
+    kernel::Log("  disc: %s (%s, %zu files, %.2f GiB)\n", gameSource.c_str(), disc.Layout().c_str(), disc.FileCount(),
+                disc.TotalBytes() / double(1ull << 30));
 
     // Static TLS (the XEX's data size, exactly) is followed by the dynamic slots.
     kernel::TlsLayout tls;
