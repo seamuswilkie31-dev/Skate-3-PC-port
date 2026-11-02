@@ -360,15 +360,30 @@ be swapped for Vulkan implementations one by one. Shaders arrive as the same
 containers the cache was built from, so a shader is a hash lookup. The
 packet-level GPU front end stays underneath for everything not yet replaced.
 
+## Rendering, step 2: the Direct3D map
+
+[D3D.md](D3D.md) maps Skate 3's statically linked Direct3D library:
+- the device set-up, swap, kick-off, fence and callback functions;
+- the four draw entry points the game calls;
+- the shader and constant uploads behind each draw.
+
+It also covers what bypasses the library: recorded command buffers the game
+replays (about 8,200 times in 90 seconds) and two places where game code
+writes GPU packets itself. The functions were found by scanning for packet
+headers and confirmed with call counters, using a new hook layer
+(`runtime/hooks`) that can wrap or replace any recompiled function.
+
+The findings change the recommendation: drive Vulkan from the command
+processor (packet level), which sees every draw whichever way it was issued,
+rather than replacing Direct3D's draw functions. D3D.md gives both options.
+
 ## Next
 
-1. **Rendering, step 2: find Direct3D.** Map the game's Direct3D library:
-   device creation, render targets and depth buffers, shader creation,
-   vertex declarations and buffers, textures and samplers, render states,
-   draws, resolves and present. The command processor's packets help here,
-   because each function leaves a recognisable trace in the ring buffer.
-   Then replace them with Vulkan, starting with what the EA intro and the
-   title screen use.
+1. **Rendering, step 3: first pixels.** With the approach settled, start the
+   Vulkan backend behind the command processor:
+   - map each loaded shader's microcode to its translated SPIR-V;
+   - model render targets and resolves;
+   - draw the EA intro and the title screen.
 2. **Input** (phase 4): pads through SDL3 (`XamInputGetState`), and keyboard
    and mouse mapped onto the same virtual pad (see the roadmap). That's what
    gets past "press Start".
