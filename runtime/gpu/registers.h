@@ -25,13 +25,37 @@ constexpr uint32_t kRbCopyDestInfo = 0x231B;    // endian (0-2), format (7-12), 
 constexpr uint32_t kRbDepthClear = 0x231D;      // 24-bit depth (8-31), stencil (0-7)
 constexpr uint32_t kRbColorClear = 0x231E;      // packed in the render target's format (ARGB for 8888)
 
+// Primitives and their state.
+constexpr uint32_t kPaScScreenScissorTl = 0x200E;  // signed x (0-14), y (16-30)
+constexpr uint32_t kPaScScreenScissorBr = 0x200F;
+constexpr uint32_t kPaScWindowScissorTl = 0x2081;  // x (0-13), y (16-29), window offset off (31)
+constexpr uint32_t kPaScWindowScissorBr = 0x2082;
+constexpr uint32_t kVgtIndxOffset = 0x2102;        // added to every index
+constexpr uint32_t kVgtMultiPrimIbResetIndx = 0x2103;
+constexpr uint32_t kRbBlendRed = 0x2105;           // blend constant (4 floats)
+constexpr uint32_t kRbStencilRefMaskBf = 0x210C;   // back faces, as kRbStencilRefMask
+constexpr uint32_t kRbAlphaRef = 0x210E;           // float
+constexpr uint32_t kPaClVportXScale = 0x210F;      // then x offset, y scale, y offset, z scale, z offset
+constexpr uint32_t kRbBlendControl0 = 0x2201;      // colour src (0-4), op (5-7), dst (8-12); alpha at 16
+constexpr uint32_t kRbColorControl = 0x2202;       // alpha function (0-2), alpha test (3)
+constexpr uint32_t kPaSuScModeCntl = 0x2205;       // cull front (0), back (1), clockwise front (2),
+                                                   // window offset (16), primitive restart (21)
+constexpr uint32_t kPaClVteCntl = 0x2206;          // viewport scale/offset enables (0-5)
+constexpr uint32_t kPaSuVtxCntl = 0x2302;          // pixel centre (0: Direct3D's, at integers)
+
 constexpr uint32_t kEdramModeColorDepth = 4;
 constexpr uint32_t kEdramModeDepth = 5;
 constexpr uint32_t kEdramModeCopy = 6;
+
+// Shader constants: 512 float4s (vertex shaders c0-c255, pixel shaders c256-c511), then
+// the fetch constants, then 256 booleans (vertex shaders 0-127, pixel shaders 128-255).
+constexpr uint32_t kAluConstants = 0x4000;
+constexpr uint32_t kPixelAluConstants = 0x4400;
 
 // Fetch constants: 6 dwords per texture, or three 2-dword vertex fetch constants in the
 // same space (vertex constant n at kFetchConstants + 2n): address | 3 (dword 0), endian
 // (bits 0-1) and size in dwords (2-25) (dword 1).
 constexpr uint32_t kFetchConstants = 0x4800;
+constexpr uint32_t kBoolConstants = 0x4900;
 
 }  // namespace s3n::gpu::reg

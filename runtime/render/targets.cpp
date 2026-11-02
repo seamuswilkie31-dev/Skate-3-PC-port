@@ -4,6 +4,7 @@
 #include "gpu/registers.h"
 #include "kernel/kernel.h"
 #include "memory.h"
+#include "render/backend.h"
 #include "render/presenter.h"
 #include "render/vulkan.h"
 
@@ -22,10 +23,12 @@ namespace {
 
 using gpu::Register;
 namespace reg = gpu::reg;
+using namespace backend;
 
 constexpr uint32_t kEdramTiles = 2048;
 constexpr uint32_t kMaxTargetHeight = 2048;
 constexpr uint32_t kMaxOperations = 4096;  // per recording, before it's submitted without a swap
+constexpr VkDeviceSize kUploadRingSize = 64ull << 20;
 
 // RB_COLOR_INFO's formats as the closest Vulkan formats. The GPU's 16-bit fixed-point
 // formats (-32 to 32) and its 7e3 floats don't exist on PC; half floats stand in for now.
@@ -91,6 +94,22 @@ uint32_t gOperations = 0;  // in the current recording
 VkSemaphore gTimeline = VK_NULL_HANDLE;
 uint64_t gTimelineValue = 0;
 
+// Each command buffer's upload ring, reset when its recording starts.
+struct UploadRing {
+    VkBuffer buffer = VK_NULL_HANDLE;
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+    uint8_t* mapped = nullptr;
+    VkDeviceAddress address = 0;
+    VkDeviceSize used = 0;
+};
+UploadRing gUploads[2];
+
+// The open rendering scope, if any.
+bool gRenderingOpen = false;
+VkCommandBuffer gRenderingCommands = VK_NULL_HANDLE;
+Image* gOpenColor = nullptr;
+Image* gOpenDepth = nullptr;
+
 uint32_t gDumpInterval = 0;
 std::string gDumpFolder;
 
@@ -125,6 +144,46 @@ std::string Describe() {
     return out;
 }
 
+// Host-visible memory with a device address, mapped for good. Device-local memory the CPU
+// can write is preferred where the GPU offers it.
+bool CreateUploadRing(UploadRing& ring, std::string& error) {
+    Vulkan& vk = Vk();
+    VkBufferCreateInfo info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+    info.size = kUploadRingSize;
+    info.usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
+                 VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+    if (!Check(vkCreateBuffer(vk.device, &info, nullptr, &ring.buffer), "vkCreateBuffer", error)) return false;
+    VkMemoryRequirements requirements;
+    vkGetBufferMemoryRequirements(vk.device, ring.buffer, &requirements);
+    VkMemoryAllocateFlagsInfo flags{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO};
+    flags.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
+    VkMemoryAllocateInfo alloc{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    alloc.pNext = &flags;
+    alloc.allocationSize = requirements.size;
+    constexpr VkMemoryPropertyFlags kHost = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+    for (VkMemoryPropertyFlags wanted : {kHost | VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, kHost}) {
+        for (uint32_t i = 0; i < vk.memory.memoryTypeCount && !ring.memory; ++i) {
+            if (!(requirements.memoryTypeBits >> i & 1) || (vk.memory.memoryTypes[i].propertyFlags & wanted) != wanted)
+                continue;
+            alloc.memoryTypeIndex = i;
+            if (vkAllocateMemory(vk.device, &alloc, nullptr, &ring.memory) != VK_SUCCESS) ring.memory = VK_NULL_HANDLE;
+        }
+    }
+    if (!ring.memory) {
+        error = "no host-visible memory for the upload ring";
+        return false;
+    }
+    void* mapped = nullptr;
+    if (!Check(vkBindBufferMemory(vk.device, ring.buffer, ring.memory, 0), "vkBindBufferMemory", error) ||
+        !Check(vkMapMemory(vk.device, ring.memory, 0, VK_WHOLE_SIZE, 0, &mapped), "vkMapMemory", error))
+        return false;
+    ring.mapped = static_cast<uint8_t*>(mapped);
+    VkBufferDeviceAddressInfo addressInfo{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
+    addressInfo.buffer = ring.buffer;
+    ring.address = vkGetBufferDeviceAddress(vk.device, &addressInfo);
+    return true;
+}
+
 bool SetUp() {
     if (gSetUp) return true;
     if (gUnavailable) return false;
@@ -145,7 +204,8 @@ bool SetUp() {
     bool ok = Check(vkCreateCommandPool(vk.device, &pool, nullptr, &gPool), "vkCreateCommandPool", error);
     alloc.commandPool = gPool;
     ok = ok && Check(vkAllocateCommandBuffers(vk.device, &alloc, gCommands), "vkAllocateCommandBuffers", error) &&
-         Check(vkCreateSemaphore(vk.device, &timeline, nullptr, &gTimeline), "vkCreateSemaphore", error);
+         Check(vkCreateSemaphore(vk.device, &timeline, nullptr, &gTimeline), "vkCreateSemaphore", error) &&
+         CreateUploadRing(gUploads[0], error) && CreateUploadRing(gUploads[1], error);
     if (!ok) {
         kernel::Log("  targets: %s\n", error.c_str());
         return false;
@@ -166,8 +226,10 @@ void WaitFor(uint64_t value) {
 
 uint64_t Submit();
 
-// The command buffer being recorded, started if need be. VK_NULL_HANDLE without a window.
-// A long recording goes to the GPU here, between operations, without waiting for a swap.
+}  // namespace
+
+namespace backend {
+
 VkCommandBuffer Commands() {
     if (!SetUp()) return VK_NULL_HANDLE;
     if (gRecording && gOperations >= kMaxOperations) Submit();
@@ -180,12 +242,80 @@ VkCommandBuffer Commands() {
         vkBeginCommandBuffer(cb, &begin);
         gRecording = true;
         gOperations = 0;
+        gUploads[gCurrent].used = 0;
     }
     return gCommands[gCurrent];
 }
 
+void Operation() { ++gOperations; }
+
+void BeginRendering(VkCommandBuffer cb, Image* color, Image* depth) {
+    if (gRenderingOpen && gRenderingCommands == cb && gOpenColor == color && gOpenDepth == depth) return;
+    EndRendering();
+    uint32_t width = UINT32_MAX, height = UINT32_MAX;
+    for (Image* image : {color, depth}) {
+        if (!image) continue;
+        width = std::min(width, image->width);
+        height = std::min(height, image->height);
+    }
+    if (width == UINT32_MAX) return;
+    VkRenderingAttachmentInfo colorAttachment{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+    VkRenderingAttachmentInfo depthAttachment{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+    VkRenderingInfo info{VK_STRUCTURE_TYPE_RENDERING_INFO};
+    info.renderArea = {{0, 0}, {width, height}};
+    info.layerCount = 1;
+    if (color) {
+        colorAttachment.imageView = color->view;
+        colorAttachment.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+        colorAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+        colorAttachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+        info.colorAttachmentCount = 1;
+        info.pColorAttachments = &colorAttachment;
+    }
+    if (depth) {
+        depthAttachment.imageView = depth->view;
+        depthAttachment.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+        depthAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+        depthAttachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+        info.pDepthAttachment = &depthAttachment;
+        info.pStencilAttachment = &depthAttachment;
+    }
+    vkCmdBeginRendering(cb, &info);
+    gRenderingOpen = true;
+    gRenderingCommands = cb;
+    gOpenColor = color;
+    gOpenDepth = depth;
+}
+
+void EndRendering() {
+    if (!gRenderingOpen) return;
+    vkCmdEndRendering(gRenderingCommands);
+    FullBarrier(gRenderingCommands);
+    gRenderingOpen = false;
+}
+
+VkCommandBuffer Allocate(VkDeviceSize size, Upload& upload) {
+    VkCommandBuffer cb = Commands();
+    if (!cb || size > kUploadRingSize) return VK_NULL_HANDLE;
+    VkDeviceSize offset = (gUploads[gCurrent].used + 255) & ~VkDeviceSize(255);
+    if (offset + size > kUploadRingSize) {  // full: this recording goes, the next starts empty
+        Submit();
+        cb = Commands();
+        offset = 0;
+    }
+    UploadRing& ring = gUploads[gCurrent];
+    ring.used = offset + size;
+    upload = {ring.mapped + offset, ring.buffer, offset, ring.address + offset};
+    return cb;
+}
+
+}  // namespace backend
+
+namespace {
+
 // Submits the recording. Returns the timeline value it signals when done.
 uint64_t Submit() {
+    EndRendering();
     VkCommandBuffer cb = gCommands[gCurrent];
     vkEndCommandBuffer(cb);
     uint64_t value = ++gTimelineValue;
@@ -217,16 +347,18 @@ uint64_t Submit() {
     return value;
 }
 
-void Operation() { ++gOperations; }
-
 // An image still in use by recorded or submitted work, freed when that's done.
 void Retire(Image& image) {
     gRetired.push_back({image, gTimelineValue + 1});
     image = Image{};
 }
 
-// The render target at `base`. The GPU has no render target height, so the image covers
-// the EDRAM from its base on, as rows of the pitch (capped).
+}  // namespace
+
+namespace backend {
+
+// The GPU has no render target height, so the image covers the EDRAM from its base on, as
+// rows of the pitch (capped).
 Image* FindTarget(uint32_t base, uint32_t pitch, uint32_t msaa, uint32_t format, bool depth, VkCommandBuffer cb) {
     if (pitch == 0 || base >= kEdramTiles || msaa > 2) return nullptr;
     for (Target& t : gTargets)
@@ -239,6 +371,7 @@ Image* FindTarget(uint32_t base, uint32_t pitch, uint32_t msaa, uint32_t format,
     uint32_t tilesPerRow = (pitch * samplesX + tileWidth - 1) / tileWidth;
     uint32_t height = std::min((kEdramTiles - base) / tilesPerRow * 16 / samplesY, kMaxTargetHeight);
     if (!height) return nullptr;
+    EndRendering();  // the new image is set up outside rendering
     VkSampleCountFlagBits samples = msaa == 2   ? VK_SAMPLE_COUNT_4_BIT
                                     : msaa == 1 ? VK_SAMPLE_COUNT_2_BIT
                                                 : VK_SAMPLE_COUNT_1_BIT;
@@ -265,6 +398,10 @@ Image* FindTarget(uint32_t base, uint32_t pitch, uint32_t msaa, uint32_t format,
     gTargets.push_back(target);
     return &gTargets.back().image;
 }
+
+}  // namespace backend
+
+namespace {
 
 // The texture a resolve writes at `address`, made (again) to fit.
 Image* DestinationTexture(uint32_t address, uint32_t width, uint32_t height, VkFormat format, uint32_t guestFormat,
@@ -338,44 +475,26 @@ void ClearTargets(VkCommandBuffer cb, Image* color, const VkClearColorValue& col
     r = {std::max(r.x0, 0), std::max(r.y0, 0), std::min(r.x1, width), std::min(r.y1, height)};
     if (r.x0 >= r.x1 || r.y0 >= r.y1) return;
 
-    VkRenderingAttachmentInfo colorAttachment{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
-    VkRenderingAttachmentInfo depthAttachment{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
-    VkRenderingInfo info{VK_STRUCTURE_TYPE_RENDERING_INFO};
-    info.renderArea = {{0, 0}, {uint32_t(width), uint32_t(height)}};
-    info.layerCount = 1;
     VkClearAttachment clears[2]{};
     uint32_t clearCount = 0;
     if (color) {
-        colorAttachment.imageView = color->view;
-        colorAttachment.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
-        colorAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
-        colorAttachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-        info.colorAttachmentCount = 1;
-        info.pColorAttachments = &colorAttachment;
         clears[clearCount].aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
         clears[clearCount++].clearValue.color = colorValue;
     }
     if (depth && depthAspects) {
-        depthAttachment.imageView = depth->view;
-        depthAttachment.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
-        depthAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
-        depthAttachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-        info.pDepthAttachment = &depthAttachment;
-        info.pStencilAttachment = &depthAttachment;
         clears[clearCount].aspectMask = depthAspects;
         clears[clearCount++].clearValue.depthStencil = depthValue;
     }
     VkClearRect rect{{{r.x0, r.y0}, {uint32_t(r.x1 - r.x0), uint32_t(r.y1 - r.y0)}}, 0, 1};
-    vkCmdBeginRendering(cb, &info);
+    BeginRendering(cb, color, depth && depthAspects ? depth : nullptr);
     vkCmdClearAttachments(cb, clearCount, clears, 1, &rect);
-    vkCmdEndRendering(cb);
-    FullBarrier(cb);
     Operation();
 }
 
 // Copies `edram` from the render target to the resolve's destination texture, where
 // `screen` is (the window offset only moved it in EDRAM).
 void CopyOut(VkCommandBuffer cb, Image& source, Rect edram, Rect screen) {
+    EndRendering();
     uint32_t address = Register(reg::kRbCopyDestBase) & 0x1FFFFFFF;
     uint32_t destPitch = Register(reg::kRbCopyDestPitch);
     uint32_t width = destPitch & 0x3FFF, height = destPitch >> 16 & 0x3FFF;
@@ -547,6 +666,7 @@ void Resolve() {
 void Swap(uint32_t frontBuffer, uint32_t width, uint32_t height) {
     VkCommandBuffer cb = Commands();
     if (!cb || !width || !height || width > 8192 || height > 8192) return;
+    EndRendering();
     Image* output = NextOutput(width, height, cb);
     if (!output) return;
 

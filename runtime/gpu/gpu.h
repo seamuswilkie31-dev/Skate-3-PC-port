@@ -43,4 +43,7 @@ constexpr uint32_t kSwapMarker = 0x53574150;  // "SWAP"
 uint32_t Register(uint32_t index);
 uint8_t* PhysicalMemory(uint32_t address);
 
+// The registers from the shader constants up (0x4000), indexed by register number.
+const uint32_t* ConstantRegisters();
+
 }  // namespace s3n::gpu

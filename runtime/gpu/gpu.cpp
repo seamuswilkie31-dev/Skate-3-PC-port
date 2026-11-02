@@ -3,6 +3,7 @@
 #include "gpu/registers.h"
 #include "kernel/kernel.h"
 #include "memory.h"
+#include "render/draws.h"
 #include "render/shader_cache.h"
 #include "render/targets.h"
 
@@ -111,6 +112,7 @@ struct BoundShader {
     bool loaded = false;
     uint64_t key = 0;
     render::Shader* shader = nullptr;  // nullptr: not in the shader cache
+    std::vector<uint8_t> microcode;    // vertex shaders: the bound copy, for its vertex fetches
 };
 BoundShader gBound[2];  // vertex, pixel
 struct UnknownShader {
@@ -137,6 +139,7 @@ void LoadShader(uint32_t type, const uint8_t* microcode, uint32_t dwords) {
     bound.loaded = true;
     bound.key = render::ShaderKey(microcode, size_t(dwords) * 4);
     bound.shader = render::FindShader(bound.key, pixel);
+    if (!pixel) bound.microcode.assign(microcode, microcode + size_t(dwords) * 4);
     if (bound.shader) {
         ++gShaderHits;
         return;
@@ -156,8 +159,9 @@ uint32_t ReadRegister(uint32_t index);
 constexpr uint64_t kDirect3DClearShader = 0x053B88DD5FD226F7ull;
 
 // VGT_DRAW_INITIATOR: primitive type (bits 0-5), index source (6-7: 0 index buffer,
-// 1 immediate, 2 auto), 32-bit indices (bit 11), index or vertex count (16-31).
-void RecordDraw(uint32_t initiator) {
+// 1 immediate, 2 auto), 32-bit indices (bit 11), index or vertex count (16-31). Draws from an
+// index buffer also have VGT_DMA_BASE and VGT_DMA_SIZE.
+void RecordDraw(uint32_t initiator, uint32_t indexBase, uint32_t indexSize) {
     ++gDraws;
     ++gPrimitives[initiator & 0x3F];
     const BoundShader &vertex = gBound[0], &pixel = gBound[1];
@@ -172,12 +176,24 @@ void RecordDraw(uint32_t initiator) {
         return;
     }
     if (!vertex.loaded || !pixel.loaded) return;
-    std::lock_guard lock(gStatsMutex);
     if (vertex.shader && pixel.shader) {
         ++gDrawsWithShaders;
-        ++gShaderPairs[vertex.shader->containerHash * 31 + pixel.shader->containerHash];
+        {
+            std::lock_guard lock(gStatsMutex);
+            ++gShaderPairs[vertex.shader->containerHash * 31 + pixel.shader->containerHash];
+        }
+        render::DrawCall call;
+        call.initiator = initiator;
+        call.indexBase = indexBase;
+        call.indexSize = indexSize;
+        call.vertexShader = vertex.shader;
+        call.pixelShader = pixel.shader;
+        call.vertexMicrocode = vertex.microcode.data();
+        call.vertexMicrocodeSize = uint32_t(vertex.microcode.size());
+        render::Draw(call);
         return;
     }
+    std::lock_guard lock(gStatsMutex);
     ++gDrawsWithUnknown;
     for (UnknownShader* u : {vertex.shader ? nullptr : &gUnknownShaders[vertex.key],
                              pixel.shader ? nullptr : &gUnknownShaders[~pixel.key]}) {
@@ -420,7 +436,7 @@ bool ExecuteType3(Stream& s, uint32_t header, int depth) {
         break;
     }
     case kLoadAluConstant: {
-        uint32_t address = s.Read() & 0x3FFFFFFF, offsetType = s.Read(), size = s.Read();
+        uint32_t address = s.Read() & 0x3FFFFFFF, offsetType = s.Read(), size = s.Read() & 0xFFF;
         static constexpr uint32_t kBases[5] = {0x4000, 0x4800, 0x4900, 0x4908, 0x2000};
         uint32_t type = (offsetType >> 16) & 0xFF;
         if (type < 5) {
@@ -448,7 +464,9 @@ bool ExecuteType3(Stream& s, uint32_t header, int depth) {
     case kDrawIndx:
     case kDrawIndx2: {
         if (opcode == kDrawIndx) s.Read();  // visibility query condition
-        RecordDraw(s.Read());
+        uint32_t initiator = s.Read(), indexBase = 0, indexSize = 0;
+        if ((initiator >> 6 & 3) == 0 && count >= (opcode == kDrawIndx ? 4u : 3u)) indexBase = s.Read(), indexSize = s.Read();
+        RecordDraw(initiator, indexBase, indexSize);
         LogOpcodeOnce(opcode, count, "draw");
         break;
     }
@@ -706,5 +724,7 @@ void CountSwap() { ++gSwaps; }
 uint32_t Register(uint32_t index) { return ReadRegister(index); }
 
 uint8_t* PhysicalMemory(uint32_t address) { return Physical(address); }
+
+const uint32_t* ConstantRegisters() { return gConstants.data(); }
 
 }  // namespace s3n::gpu
