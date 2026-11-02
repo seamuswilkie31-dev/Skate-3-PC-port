@@ -79,6 +79,7 @@ enum Opcode : uint32_t {
 GuestMemory* gMemory = nullptr;
 uint8_t* gBase = nullptr;
 std::vector<uint32_t> gConstants(kRegisterCount);  // registers from kWindowRegisters up
+uint64_t gConstantsVersion[2] = {};                // vertex and pixel ALU constants: one more per write
 
 std::atomic<uint32_t> gRingBase{0};    // physical
 std::atomic<uint32_t> gRingDwords{0};  // 0 until the title sets the ring up
@@ -240,6 +241,7 @@ void WriteRegister(uint32_t index, uint32_t value) {
     if (index >= kRegisterCount) return;
     if (index < kWindowRegisters) StoreBE32(gBase, kRegisterWindow + index * 4, value);
     else gConstants[index] = value;
+    if (index >= reg::kAluConstants && index < reg::kFetchConstants) ++gConstantsVersion[(index - reg::kAluConstants) >> 10];
 
     if (index >= kScratchReg0 && index < kScratchReg0 + 8) {
         MirrorScratch(index - kScratchReg0, value);
@@ -778,5 +780,7 @@ uint32_t Register(uint32_t index) { return ReadRegister(index); }
 uint8_t* PhysicalMemory(uint32_t address) { return Physical(address); }
 
 const uint32_t* ConstantRegisters() { return gConstants.data(); }
+
+uint64_t ConstantsVersion(uint32_t stage) { return gConstantsVersion[stage & 1]; }
 
 }  // namespace s3n::gpu

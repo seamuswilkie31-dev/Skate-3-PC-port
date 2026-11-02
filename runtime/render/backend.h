@@ -40,6 +40,10 @@ struct Upload {
 };
 VkCommandBuffer Allocate(VkDeviceSize size, Upload& upload);
 
+// The recording being made: a number that changes when one is submitted and the next begins.
+// Upload space stays valid for as long as its recording is the one being made.
+uint64_t RecordingNumber();
+
 // Frames finished so far (swaps handled).
 uint64_t FrameNumber();
 
@@ -63,6 +67,9 @@ inline uint64_t HashMemory(const uint8_t* data, size_t size) {
 // The texture a resolve last wrote at this physical address, or nullptr. serial changes
 // whenever the image is made again.
 Image* ResolvedImage(uint32_t address, uint64_t& serial);
+
+// Changes whenever a resolve texture's image is made (again).
+uint64_t ResolveSerial();
 
 // --capture-frame: true while the frame being built is the one to log in full.
 bool Capturing();

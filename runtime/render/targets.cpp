@@ -106,6 +106,7 @@ struct UploadRing {
     VkDeviceSize used = 0;
 };
 UploadRing gUploads[2];
+uint64_t gRecordingNumber = 0;  // recordings started
 
 // The open rendering scope, if any.
 bool gRenderingOpen = false;
@@ -247,6 +248,7 @@ VkCommandBuffer Commands() {
         begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
         vkBeginCommandBuffer(cb, &begin);
         gRecording = true;
+        ++gRecordingNumber;
         gOperations = 0;
         gUploads[gCurrent].used = 0;
     }
@@ -301,6 +303,10 @@ void EndRendering() {
 }
 
 uint64_t FrameNumber() { return gFrames; }
+
+uint64_t RecordingNumber() { return gRecordingNumber; }
+
+uint64_t ResolveSerial() { return gTextureSerial; }
 
 bool Capturing() { return gCaptureFrame && gFrames + 1 == gCaptureFrame; }
 

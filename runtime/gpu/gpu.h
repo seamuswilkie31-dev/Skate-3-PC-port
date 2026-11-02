@@ -46,4 +46,8 @@ uint8_t* PhysicalMemory(uint32_t address);
 // The registers from the shader constants up (0x4000), indexed by register number.
 const uint32_t* ConstantRegisters();
 
+// Changes whenever a vertex (stage 0) or pixel (1) ALU constant is written, so the renderer
+// can tell when to upload them again. Command processor thread only.
+uint64_t ConstantsVersion(uint32_t stage);
+
 }  // namespace s3n::gpu

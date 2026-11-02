@@ -338,13 +338,45 @@ bool SetUp(VkCommandBuffer cb) {
 const VkDescriptorSetLayout* SetLayouts() { return gSetLayouts; }
 const VkDescriptorSet* Sets() { return gSets; }
 
-Slots Bind(uint32_t index) {
+namespace {
+
+// The slots a fetch constant was given this frame. A texture is checked once a frame, so
+// within one the same fetch constant binds the same way, until a resolve makes a new image.
+struct Bound {
+    uint32_t fetch[6];
     Slots slots;
-    if (!gSetUp || index >= 32) return slots;
+};
+std::unordered_map<uint64_t, Bound> gBound;
+uint64_t gBoundFrame = ~0ull, gBoundSerial = ~0ull;
+
+Slots BindFetch(const uint32_t fetch[6]);
+
+}  // namespace
+
+Slots Bind(uint32_t index) {
+    if (!gSetUp || index >= 32) return {};
     uint32_t fetch[6];
     for (uint32_t i = 0; i < 6; ++i) fetch[i] = Register(reg::kFetchConstants + index * 6 + i);
-    if ((fetch[0] & 3) != 2) return slots;  // not a texture
-    slots.sampler = SamplerSlot(fetch);
+    if (gBoundFrame != FrameNumber() || gBoundSerial != ResolveSerial()) {
+        gBound.clear();
+        gBoundFrame = FrameNumber();
+        gBoundSerial = ResolveSerial();
+    }
+    uint64_t key = HashMemory(reinterpret_cast<const uint8_t*>(fetch), sizeof fetch);
+    auto it = gBound.find(key);
+    if (it != gBound.end() && std::memcmp(it->second.fetch, fetch, sizeof fetch) == 0) return it->second.slots;
+    Slots slots = BindFetch(fetch);
+    Bound& bound = gBound[key];
+    std::memcpy(bound.fetch, fetch, sizeof fetch);
+    bound.slots = slots;
+    return slots;
+}
+
+namespace {
+
+Slots BindFetch(const uint32_t fetch[6]) {
+    Slots slots;
+    if ((fetch[0] & 3) != 2) return slots;  // not a texture    slots.sampler = SamplerSlot(fetch);
     uint32_t dimension = fetch[5] >> 9 & 3;  // 1D, 2D (or stacked), 3D, cube
     if (dimension != 1 || (fetch[1] >> 10 & 1)) {
         slots.kind = dimension == 2 ? 1 : dimension == 3 ? 2 : 0;  // white until those are converted
@@ -416,5 +448,7 @@ Slots Bind(uint32_t index) {
     slots.texture = ViewSlot(texture.image, 0, swizzle, info.channel);
     return slots;
 }
+
+}  // namespace
 
 }  // namespace s3n::render::textures

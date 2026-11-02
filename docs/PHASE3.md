@@ -659,8 +659,30 @@ processor's idle, wait and swap time, and its time in draws by phase.
 `--profile-thread n` samples a guest thread's link register. Frame dumps say
 when they were taken, for timing `--press`.
 
-**Next for speed:** faster vertex conversion and index reading, constants
-uploaded only when they change, converted vertices kept on the GPU.
+## In the world: 30 frames a second
+
+At 19 fps the command processor spent about 36 ms on each frame's draws,
+then waited for the vsync flip. Cutting the per-draw work:
+- **Vertex conversion** decides each fetch's scaling, valid range and
+  swizzle once per draw, then runs one loop per format. Half floats come
+  from a table instead of two `ldexp` calls each.
+- **Indices** are read by one loop per endian swap and index size. Then a
+  pass finds the range and rebases them, with no branches unless primitive
+  restart is on.
+- **Constants:** each stage's 4 KB is uploaded again only when a constant
+  register has been written since, or a new recording has begun.
+- **Recording:** pipeline, descriptor sets, viewport, scissor, stencil and
+  blend constants are recorded only when they change within a recording.
+  The pipeline key hashes 8 bytes at a time.
+- **Textures:** a fetch constant binds the same way all frame, so its slots
+  are remembered until the next frame or a new resolve image.
+
+**Result:** about 5.7 µs a draw, down from 10.4. The game runs at **30 fps
+in Port Carverton**, its own cap (frames are paced by the vsync flip). The
+command processor is about half busy in game, so the next frame rate gains
+come from lifting that cap (the 60/120/240 fps option), not from here.
+
+**Still slow to load:** the time between screens is the game's own loading.
 
 ## Next
 

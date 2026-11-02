@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cfloat>
 #include <chrono>
 #include <cmath>
 #include <cstring>
@@ -107,10 +108,7 @@ struct PipelineKey {
 };
 struct KeyHash {
     size_t operator()(const PipelineKey& key) const {
-        uint64_t hash = 0xCBF29CE484222325ull;
-        auto bytes = reinterpret_cast<const uint8_t*>(&key);
-        for (size_t i = 0; i < sizeof key; ++i) hash = (hash ^ bytes[i]) * 0x100000001B3ull;
-        return size_t(hash);
+        return size_t(HashMemory(reinterpret_cast<const uint8_t*>(&key), sizeof key));
     }
 };
 struct KeyEqual {
@@ -124,6 +122,27 @@ bool gSetUp = false;
 bool gUnavailable = false;
 VkPipelineLayout gPipelineLayout = VK_NULL_HANDLE;
 VkPipelineCache gPipelineCache = VK_NULL_HANDLE;
+
+// The constants last uploaded for each stage: reused while they're unchanged and still in
+// the recording being made.
+struct UploadedConstants {
+    uint64_t version = ~0ull, recording = ~0ull;
+    VkDeviceAddress address = 0;
+};
+UploadedConstants gUploadedConstants[2];
+
+// What the recording being made already has bound and set, so draws record only changes.
+// Vulkan keeps it across rendering scopes within a command buffer.
+struct RecordedState {
+    uint64_t recording = ~0ull;
+    VkPipeline pipeline = VK_NULL_HANDLE;
+    VkViewport viewport{};
+    VkRect2D scissor{};
+    uint32_t stencil[2] = {};  // RB_STENCILREFMASK, front and back
+    uint32_t blend[4] = {};    // blend constants' bits
+    bool viewportSet = false, scissorSet = false, stencilSet = false, blendSet = false;
+};
+RecordedState gRecorded;
 
 // Where the command processor's time in draws goes, for the report.
 enum Phase { kPhaseIndices, kPhaseTextures, kPhaseUpload, kPhaseVertices, kPhaseRecording, kPhaseCount };
@@ -303,7 +322,7 @@ uint32_t Swap(uint32_t word, uint32_t endian) {
     }
 }
 
-uint32_t FormatWords(uint32_t format) {
+constexpr uint32_t FormatWords(uint32_t format) {
     switch (format) {
     case 6: case 7: case 16: case 17: case 25: case 31: case 33: case 36: return 1;
     case 26: case 32: case 34: case 37: return 2;
@@ -320,73 +339,131 @@ float Half(uint32_t h) {
     return h & 0x8000 ? -value : value;
 }
 
-float Component(uint32_t raw, uint32_t bits, bool isSigned, bool isInteger) {
-    if (isSigned) {
-        int32_t value = SignExtend(raw, bits);
-        return isInteger ? float(value) : std::max(float(value) / float((1u << (bits - 1)) - 1), -1.0f);
-    }
-    if (isInteger) return float(raw);
-    return float(raw) / float(bits == 32 ? 4294967295.0 : double((1ull << bits) - 1));
+// All 65,536 half floats, worked out once.
+const float* Halves() {
+    static const std::vector<float> table = [] {
+        std::vector<float> t(65536);
+        for (uint32_t h = 0; h < 65536; ++h) t[h] = Half(h);
+        return t;
+    }();
+    return table.data();
 }
 
-float Float(uint32_t bits) {
-    float value;
-    std::memcpy(&value, &bits, 4);
-    return value;
+// Bits in each component of the packed integer formats, from the low end of each dword.
+void ComponentBits(uint32_t format, uint32_t bits[4]) {
+    static constexpr struct {
+        uint32_t format;
+        uint8_t bits[4];
+    } kFormats[] = {
+        {6, {8, 8, 8, 8}},     {7, {10, 10, 10, 2}},  {16, {11, 11, 10, 0}},  {17, {10, 11, 11, 0}}, {25, {16, 16, 0, 0}},
+        {26, {16, 16, 16, 16}}, {33, {32, 0, 0, 0}}, {34, {32, 32, 0, 0}}, {35, {32, 32, 32, 32}},
+    };
+    for (const auto& f : kFormats)
+        if (f.format == format)
+            for (int i = 0; i < 4; ++i) bits[i] = f.bits[i];
 }
 
-// One fetched element as float4 (missing components 0, 0, 0, 1). Components are packed
-// from the low bits of each (endian-swapped) dword.
-void Unpack(const Fetch& f, const uint32_t* w, float v[4]) {
-    auto c = [&](uint32_t raw, uint32_t bits) { return Component(raw, bits, f.isSigned, f.isInteger); };
-    switch (f.format) {
-    case 6:  // 8_8_8_8
-        for (int i = 0; i < 4; ++i) v[i] = c(w[0] >> (8 * i) & 0xFF, 8);
-        break;
-    case 7:  // 2_10_10_10
-        v[0] = c(w[0] & 0x3FF, 10), v[1] = c(w[0] >> 10 & 0x3FF, 10), v[2] = c(w[0] >> 20 & 0x3FF, 10);
-        v[3] = c(w[0] >> 30, 2);
-        break;
-    case 16:  // 10_11_11
-        v[0] = c(w[0] & 0x7FF, 11), v[1] = c(w[0] >> 11 & 0x7FF, 11), v[2] = c(w[0] >> 22, 10);
-        break;
-    case 17:  // 11_11_10
-        v[0] = c(w[0] & 0x3FF, 10), v[1] = c(w[0] >> 10 & 0x7FF, 11), v[2] = c(w[0] >> 21, 11);
-        break;
-    case 25:  // 16_16
-        v[0] = c(w[0] & 0xFFFF, 16), v[1] = c(w[0] >> 16, 16);
-        break;
-    case 26:  // 16_16_16_16
-        v[0] = c(w[0] & 0xFFFF, 16), v[1] = c(w[0] >> 16, 16), v[2] = c(w[1] & 0xFFFF, 16), v[3] = c(w[1] >> 16, 16);
-        break;
-    case 31:  // 16_16 float
-        v[0] = Half(w[0] & 0xFFFF), v[1] = Half(w[0] >> 16);
-        break;
-    case 32:  // 16_16_16_16 float
-        v[0] = Half(w[0] & 0xFFFF), v[1] = Half(w[0] >> 16), v[2] = Half(w[1] & 0xFFFF), v[3] = Half(w[1] >> 16);
-        break;
-    case 33: case 34: case 35:  // 32, 32_32, 32_32_32_32
-        for (uint32_t i = 0; i < FormatWords(f.format); ++i) v[i] = c(w[i], 32);
-        break;
-    case 36: case 37: case 38: case 57:  // floats
-        for (uint32_t i = 0; i < FormatWords(f.format); ++i) v[i] = Float(w[i]);
-        break;
-    }
-    if (f.exponent && f.format != 31 && f.format != 32 && f.format < 36)
-        for (int i = 0; i < 4; ++i) v[i] = std::ldexp(v[i], f.exponent);
-}
+// How one fetch's elements become shader inputs, worked out once for a draw's vertices.
+// Integer components are scaled to normalised values (times 2^exponent); signed normalised
+// ones stop at -1. A destination swizzle gives, for each register component, the fetched
+// component (0-3), 0 (4) or 1 (5) it gets, or nothing (7). Direct3D sets the bound one for
+// the declared type: 16-bit pairs in a big-endian buffer come out of the endian swap high
+// half first, so a SHORT2 takes y, x. The translated shader reads its input through the
+// container's swizzle, so each value goes where that one looks for it.
+struct Decoder {
+    const uint8_t* buffer = nullptr;  // the vertex buffer
+    int64_t at = 0, step = 0;         // vertex 0's element in it, and bytes per vertex
+    uint32_t begin = 0, end = 0;      // the vertices whose element lies inside the buffer
+    float scale[4] = {1.0f, 1.0f, 1.0f, 1.0f};
+    float low[4] = {-FLT_MAX, -FLT_MAX, -FLT_MAX, -FLT_MAX};
+    int8_t from[4] = {0, 1, 2, 3};  // each input component's fetched component, or 4 (0) or 5 (1)
+};
 
-// A destination swizzle gives, for each register component, the fetched component (0-3), 0
-// (4) or 1 (5) it gets, or nothing (7). Direct3D sets the bound one for the declared type:
-// 16-bit pairs in a big-endian buffer come out of the endian swap high half first, so a
-// SHORT2 takes y, x. The translated shader reads its input through the container's swizzle,
-// so each value goes where that one looks for it.
-void Reswizzle(const Fetch& f, const float value[4], float input[4]) {
-    std::memcpy(input, value, 16);
+Decoder MakeDecoder(const Fetch& f, uint32_t first, uint32_t count) {
+    Decoder d;
     for (int i = 0; i < 4; ++i) {
         uint32_t from = f.swizzle >> (3 * i) & 7, to = f.shaderSwizzle >> (3 * i) & 7;
-        if (to > 3 || from > 5) continue;  // the shader writes a constant there, or nothing's written
-        input[to] = from < 4 ? value[from] : float(from - 4);
+        if (to <= 3 && from <= 5) d.from[to] = int8_t(from);  // else a constant, or nothing written
+    }
+    uint32_t words = FormatWords(f.format);
+    if (!f.valid || !words) return d;
+    uint32_t bits[4] = {};
+    ComponentBits(f.format, bits);
+    float exponent = std::ldexp(1.0f, f.exponent);
+    for (int i = 0; i < 4; ++i) {
+        if (!bits[i]) continue;
+        double range = f.isInteger ? 1.0 : double((1ull << (f.isSigned ? bits[i] - 1 : bits[i])) - 1);
+        d.scale[i] = float(exponent / range);
+        if (f.isSigned && !f.isInteger) d.low[i] = -exponent;
+    }
+    d.buffer = gpu::PhysicalMemory(f.base);
+    d.at = (int64_t(first) * f.stride + f.offset) * 4;
+    d.step = int64_t(f.stride) * 4;
+    int64_t last = int64_t(f.end) - f.base - words * 4;  // the last place an element fits
+    int64_t begin = 0, end = count;
+    if (d.step) {
+        if (d.at < 0) begin = (-d.at + d.step - 1) / d.step;
+        end = d.at > last ? 0 : (last - d.at) / d.step + 1;
+    } else if (d.at < 0 || d.at > last) {
+        end = 0;
+    }
+    d.end = uint32_t(std::clamp<int64_t>(end, 0, count));
+    d.begin = uint32_t(std::clamp<int64_t>(begin, 0, d.end));
+    return d;
+}
+
+// One fetch's elements for vertices [0, count), as the shader's inputs, every `stride` bytes
+// of `out`. Components the format lacks are 0, 0, 0, 1; so is all of a vertex outside the
+// buffer.
+template <uint32_t kFormat>
+void Decode(const Fetch& f, const Decoder& d, uint32_t count, uint8_t* out, uint32_t stride) {
+    constexpr uint32_t kWords = FormatWords(kFormat);
+    constexpr bool kFloat = kFormat == 31 || kFormat == 32 || kFormat >= 36;
+    const float* halves = Halves();
+    bool isSigned = f.isSigned, indices = f.usage == kUsageBlendIndices;
+    uint32_t endian = f.endian;
+    auto field = [isSigned](uint32_t word, uint32_t shift, uint32_t bits) {
+        uint32_t raw = uint32_t(word >> shift & ((1ull << bits) - 1));
+        return isSigned ? float(SignExtend(raw, bits)) : float(raw);
+    };
+    for (uint32_t v = 0; v < count; ++v, out += stride) {
+        float c[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+        if (kWords && v >= d.begin && v < d.end) {
+            const uint8_t* data = d.buffer + (d.at + int64_t(v) * d.step);
+            uint32_t w[kWords ? kWords : 1];
+            for (uint32_t i = 0; i < kWords; ++i) {
+                std::memcpy(&w[i], data + i * 4, 4);
+                w[i] = Swap(w[i], endian);
+            }
+            if constexpr (kFormat == 6) {
+                for (int i = 0; i < 4; ++i) c[i] = field(w[0], 8 * i, 8);
+            } else if constexpr (kFormat == 7) {
+                c[0] = field(w[0], 0, 10), c[1] = field(w[0], 10, 10), c[2] = field(w[0], 20, 10), c[3] = field(w[0], 30, 2);
+            } else if constexpr (kFormat == 16) {
+                c[0] = field(w[0], 0, 11), c[1] = field(w[0], 11, 11), c[2] = field(w[0], 22, 10);
+            } else if constexpr (kFormat == 17) {
+                c[0] = field(w[0], 0, 10), c[1] = field(w[0], 10, 11), c[2] = field(w[0], 21, 11);
+            } else if constexpr (kFormat == 25 || kFormat == 26) {
+                for (uint32_t i = 0; i < kWords * 2; ++i) c[i] = field(w[i / 2], 16 * (i & 1), 16);
+            } else if constexpr (kFormat >= 33 && kFormat <= 35) {
+                for (uint32_t i = 0; i < kWords; ++i) c[i] = isSigned ? float(int32_t(w[i])) : float(w[i]);
+            } else if constexpr (kFormat == 31 || kFormat == 32) {
+                for (uint32_t i = 0; i < kWords * 2; ++i) c[i] = halves[w[i / 2] >> (16 * (i & 1)) & 0xFFFF];
+            } else if constexpr (kFloat) {
+                std::memcpy(c, w, kWords * 4);
+            }
+            if constexpr (!kFloat)
+                for (int i = 0; i < 4; ++i) c[i] = std::max(c[i] * d.scale[i], d.low[i]);
+        }
+        float input[4];
+        for (int i = 0; i < 4; ++i) input[i] = d.from[i] < 4 ? c[d.from[i]] : float(d.from[i] - 4);
+        if (indices) {
+            uint32_t values[4];
+            for (int i = 0; i < 4; ++i) values[i] = uint32_t(std::max(input[i], 0.0f));
+            std::memcpy(out, values, 16);
+        } else {
+            std::memcpy(out, input, 16);
+        }
     }
 }
 
@@ -395,29 +472,25 @@ void ConvertVertices(const std::vector<Fetch>& fetches, uint32_t first, uint32_t
     uint32_t stride = uint32_t(fetches.size()) * 16;
     for (size_t e = 0; e < fetches.size(); ++e) {
         const Fetch& f = fetches[e];
-        uint32_t words = FormatWords(f.format);
-        for (uint32_t v = 0; v < count; ++v) {
-            float value[4] = {0.0f, 0.0f, 0.0f, 1.0f};
-            int64_t address = int64_t(f.base) + (int64_t(first + v) * f.stride + f.offset) * 4;
-            if (f.valid && words && address >= f.base && address + words * 4 <= f.end) {
-                const uint8_t* data = gpu::PhysicalMemory(uint32_t(address));
-                uint32_t w[4];
-                for (uint32_t i = 0; i < words; ++i) {
-                    std::memcpy(&w[i], data + i * 4, 4);
-                    w[i] = Swap(w[i], f.endian);
-                }
-                Unpack(f, w, value);
-            }
-            float input[4];
-            Reswizzle(f, value, input);
-            uint8_t* destination = out + size_t(v) * stride + e * 16;
-            if (f.usage == kUsageBlendIndices) {
-                uint32_t indices[4];
-                for (int i = 0; i < 4; ++i) indices[i] = uint32_t(std::max(input[i], 0.0f));
-                std::memcpy(destination, indices, 16);
-            } else {
-                std::memcpy(destination, input, 16);
-            }
+        Decoder d = MakeDecoder(f, first, count);
+        uint8_t* column = out + e * 16;
+        switch (f.format) {
+        case 6: Decode<6>(f, d, count, column, stride); break;
+        case 7: Decode<7>(f, d, count, column, stride); break;
+        case 16: Decode<16>(f, d, count, column, stride); break;
+        case 17: Decode<17>(f, d, count, column, stride); break;
+        case 25: Decode<25>(f, d, count, column, stride); break;
+        case 26: Decode<26>(f, d, count, column, stride); break;
+        case 31: Decode<31>(f, d, count, column, stride); break;
+        case 32: Decode<32>(f, d, count, column, stride); break;
+        case 33: Decode<33>(f, d, count, column, stride); break;
+        case 34: Decode<34>(f, d, count, column, stride); break;
+        case 35: Decode<35>(f, d, count, column, stride); break;
+        case 36: Decode<36>(f, d, count, column, stride); break;
+        case 37: Decode<37>(f, d, count, column, stride); break;
+        case 38: Decode<38>(f, d, count, column, stride); break;
+        case 57: Decode<57>(f, d, count, column, stride); break;
+        default: Decode<0>(f, d, count, column, stride); break;  // unsupported: defaults
         }
     }
 }
@@ -509,6 +582,38 @@ void CachedVertices(const std::vector<Fetch>& fetches, uint32_t first, uint32_t 
     if (frame >= gVertexCacheSwept + kCacheFrames / 2) {
         gVertexCacheSwept = frame;
         std::erase_if(gVertexCache, [frame](const auto& item) { return item.second.usedFrame + kCacheFrames < frame; });
+    }
+}
+
+// An index buffer's indices: endian-swapped dwords, low half first for 16-bit ones.
+template <uint32_t kEndian, bool kWide>
+void ReadIndices(const uint8_t* data, uint32_t count, uint32_t* out) {
+    uint32_t word;
+    if constexpr (kWide) {
+        for (uint32_t i = 0; i < count; ++i) {
+            std::memcpy(&word, data + i * 4, 4);
+            out[i] = Swap(word, kEndian);
+        }
+    } else {
+        for (uint32_t i = 0; i < count; i += 2) {
+            std::memcpy(&word, data + i * 2, 4);
+            word = Swap(word, kEndian);
+            out[i] = word & 0xFFFF;
+            if (i + 1 < count) out[i + 1] = word >> 16;
+        }
+    }
+}
+
+void ReadIndices(const uint8_t* data, uint32_t count, bool wide, uint32_t endian, uint32_t* out) {
+    switch (endian << 1 | uint32_t(wide)) {
+    case 0: ReadIndices<0, false>(data, count, out); break;
+    case 1: ReadIndices<0, true>(data, count, out); break;
+    case 2: ReadIndices<1, false>(data, count, out); break;
+    case 3: ReadIndices<1, true>(data, count, out); break;
+    case 4: ReadIndices<2, false>(data, count, out); break;
+    case 5: ReadIndices<2, true>(data, count, out); break;
+    case 6: ReadIndices<3, false>(data, count, out); break;
+    default: ReadIndices<3, true>(data, count, out); break;
     }
 }
 
@@ -702,30 +807,35 @@ void Draw(const DrawCall& call) {
         uint32_t endian = call.indexSize >> 30, available = call.indexSize & 0xFFFFFF;
         count = std::min(count, available);
         uint32_t resetIndex = Register(reg::kVgtMultiPrimIbResetIndx) & (wide ? 0xFFFFFFFF : 0xFFFF);
-        const uint8_t* data = gpu::PhysicalMemory(call.indexBase & (wide ? ~3u : ~1u));
-        first = UINT32_MAX, last = 0;
-        for (uint32_t i = 0; i < count; ++i) {
-            uint32_t word;
-            std::memcpy(&word, data + (wide ? i * 4 : i / 2 * 4), 4);
-            word = Swap(word, endian);
-            uint32_t index = wide ? word : (i & 1 ? word >> 16 : word & 0xFFFF);
-            if (restart && index == resetIndex) {
-                indices.push_back(UINT32_MAX);
-                continue;
+        indices.resize(count);
+        uint32_t* p = indices.data();
+        ReadIndices(gpu::PhysicalMemory(call.indexBase & (wide ? ~3u : ~1u)), count, wide, endian, p);
+        if (restart) {
+            first = UINT32_MAX, last = 0;
+            for (uint32_t i = 0; i < count; ++i) {
+                if (p[i] == resetIndex) {
+                    p[i] = UINT32_MAX;
+                    continue;
+                }
+                p[i] += indexOffset;
+                first = std::min(first, p[i]), last = std::max(last, p[i]);
             }
-            index += indexOffset;
-            first = std::min(first, index), last = std::max(last, index);
-            indices.push_back(index);
-        }
-        if (first > last) return;  // nothing but restarts
-        for (uint32_t& index : indices)
-            if (index != UINT32_MAX) index -= first;
-    } else if (primitive == 13) {
+            if (first > last) return;  // nothing but restarts
+            for (uint32_t i = 0; i < count; ++i)
+                if (p[i] != UINT32_MAX) p[i] -= first;
+        } else {
+            uint32_t low = UINT32_MAX, high = 0;
+            for (uint32_t i = 0; i < count; ++i) low = std::min(low, p[i]), high = std::max(high, p[i]);
+            if (low > high) return;  // no indices
+            for (uint32_t i = 0; i < count; ++i) p[i] -= low;
+            first = low + indexOffset, last = high + indexOffset;
+        }    } else if (primitive == 13) {
         for (uint32_t i = 0; i < count; ++i) indices.push_back(i);
     }
     if (primitive == 13) {  // quads (a, b, c, d) as triangles (a, b, c) and (a, c, d)
-        std::vector<uint32_t> quads;
+        static thread_local std::vector<uint32_t> quads;
         quads.swap(indices);
+        indices.clear();
         for (size_t q = 0; q + 3 < quads.size(); q += 4)
             for (size_t i : {0, 1, 2, 0, 2, 3}) indices.push_back(quads[q + i]);
         if (indices.empty()) return;
@@ -753,22 +863,44 @@ void Draw(const DrawCall& call) {
         if (textureMask >> s & 1) slots[s] = textures::Bind(s);
     lap(kPhaseTextures);
 
-    // Everything the draw reads, in one block of the upload ring: both stages' constants,
-    // the shared constants, the vertices and the indices.
-    size_t vertexAt = Align(2 * kStageConstantsSize + kSharedSize);
-    size_t indexAt = Align(vertexAt + size_t(vertexCount) * vertexStride);
-    size_t total = indexAt + indices.size() * 4;
+    // Everything the draw reads, in one block of the upload ring: each stage's constants
+    // unless they're unchanged in this recording, the shared constants, the vertices and
+    // the indices.
+    bool stale[2];
+    size_t sharedAt, vertexAt, indexAt, total;
+    auto layOut = [&] {
+        for (uint32_t stage = 0; stage < 2; ++stage) {
+            const UploadedConstants& u = gUploadedConstants[stage];
+            stale[stage] = u.recording != RecordingNumber() || u.version != gpu::ConstantsVersion(stage);
+        }
+        sharedAt = (size_t(stale[0]) + stale[1]) * kStageConstantsSize;
+        vertexAt = Align(sharedAt + kSharedSize);
+        indexAt = Align(vertexAt + size_t(vertexCount) * vertexStride);
+        total = indexAt + indices.size() * 4;
+    };
+    layOut();
+    uint64_t recording = RecordingNumber();
     Upload upload;
     VkCommandBuffer cb = Allocate(total, upload);
+    if (cb && RecordingNumber() != recording) {  // the ring was full: a new recording has none
+        layOut();
+        cb = Allocate(total, upload);
+    }
     if (!cb) {
         ++gSkipped[kNoWindow];
         return;
     }
     lap(kPhaseUpload);
     const uint32_t* registers = gpu::ConstantRegisters();
-    std::memcpy(upload.data, registers + reg::kAluConstants, kStageConstantsSize);
-    std::memcpy(upload.data + kStageConstantsSize, registers + reg::kPixelAluConstants, kStageConstantsSize);
-    uint8_t* shared = upload.data + 2 * kStageConstantsSize;
+    size_t constantsAt = 0;
+    for (uint32_t stage = 0; stage < 2; ++stage) {
+        if (!stale[stage]) continue;
+        std::memcpy(upload.data + constantsAt, registers + (stage ? reg::kPixelAluConstants : reg::kAluConstants),
+                    kStageConstantsSize);
+        gUploadedConstants[stage] = {gpu::ConstantsVersion(stage), RecordingNumber(), upload.address + constantsAt};
+        constantsAt += kStageConstantsSize;
+    }
+    uint8_t* shared = upload.data + sharedAt;
     std::memset(shared, 0, kSharedSize);  // slot 0: white, and the default sampler
     for (uint32_t s = 0; s < 16; ++s) {
         std::memcpy(shared + slots[s].kind * 64 + s * 4, &slots[s].texture, 4);
@@ -891,27 +1023,52 @@ void Draw(const DrawCall& call) {
                     textureList.c_str(), inputList.c_str());
     }
 
-    // Record.
+    // Record: only what the recording doesn't have already.
     BeginRendering(cb, color, depth);
-    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
-    vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, gPipelineLayout, 0, 4, textures::Sets(), 0, nullptr);
-    uint64_t addresses[3] = {upload.address, upload.address + kStageConstantsSize,
-                             upload.address + 2 * kStageConstantsSize};
+    RecordedState& state = gRecorded;
+    if (state.recording != RecordingNumber()) {
+        state = {};
+        state.recording = RecordingNumber();
+        vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, gPipelineLayout, 0, 4, textures::Sets(), 0, nullptr);
+    }
+    if (state.pipeline != pipeline) {
+        vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+        state.pipeline = pipeline;
+    }
+    uint64_t addresses[3] = {gUploadedConstants[0].address, gUploadedConstants[1].address, upload.address + sharedAt};
     vkCmdPushConstants(cb, gPipelineLayout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0,
                        sizeof addresses, addresses);
-    vkCmdSetViewport(cb, 0, 1, &viewport);
-    vkCmdSetScissor(cb, 0, 1, &scissor);
+    if (!state.viewportSet || std::memcmp(&state.viewport, &viewport, sizeof viewport)) {
+        vkCmdSetViewport(cb, 0, 1, &viewport);
+        state.viewport = viewport;
+        state.viewportSet = true;
+    }
+    if (!state.scissorSet || std::memcmp(&state.scissor, &scissor, sizeof scissor)) {
+        vkCmdSetScissor(cb, 0, 1, &scissor);
+        state.scissor = scissor;
+        state.scissorSet = true;
+    }
     uint32_t front = Register(reg::kRbStencilRefMask);
     uint32_t back = key.depthControl >> 7 & 1 ? Register(reg::kRbStencilRefMaskBf) : front;
-    vkCmdSetStencilReference(cb, VK_STENCIL_FACE_FRONT_BIT, front & 0xFF);
-    vkCmdSetStencilReference(cb, VK_STENCIL_FACE_BACK_BIT, back & 0xFF);
-    vkCmdSetStencilCompareMask(cb, VK_STENCIL_FACE_FRONT_BIT, front >> 8 & 0xFF);
-    vkCmdSetStencilCompareMask(cb, VK_STENCIL_FACE_BACK_BIT, back >> 8 & 0xFF);
-    vkCmdSetStencilWriteMask(cb, VK_STENCIL_FACE_FRONT_BIT, front >> 16 & 0xFF);
-    vkCmdSetStencilWriteMask(cb, VK_STENCIL_FACE_BACK_BIT, back >> 16 & 0xFF);
-    float blendConstants[4];
-    for (int i = 0; i < 4; ++i) blendConstants[i] = RegisterFloat(reg::kRbBlendRed + i);
-    vkCmdSetBlendConstants(cb, blendConstants);
+    if (!state.stencilSet || state.stencil[0] != front || state.stencil[1] != back) {
+        vkCmdSetStencilReference(cb, VK_STENCIL_FACE_FRONT_BIT, front & 0xFF);
+        vkCmdSetStencilReference(cb, VK_STENCIL_FACE_BACK_BIT, back & 0xFF);
+        vkCmdSetStencilCompareMask(cb, VK_STENCIL_FACE_FRONT_BIT, front >> 8 & 0xFF);
+        vkCmdSetStencilCompareMask(cb, VK_STENCIL_FACE_BACK_BIT, back >> 8 & 0xFF);
+        vkCmdSetStencilWriteMask(cb, VK_STENCIL_FACE_FRONT_BIT, front >> 16 & 0xFF);
+        vkCmdSetStencilWriteMask(cb, VK_STENCIL_FACE_BACK_BIT, back >> 16 & 0xFF);
+        state.stencil[0] = front, state.stencil[1] = back;
+        state.stencilSet = true;
+    }
+    uint32_t blendConstants[4];
+    for (int i = 0; i < 4; ++i) blendConstants[i] = Register(reg::kRbBlendRed + i);
+    if (!state.blendSet || std::memcmp(state.blend, blendConstants, sizeof blendConstants)) {
+        float values[4];
+        std::memcpy(values, blendConstants, sizeof values);
+        vkCmdSetBlendConstants(cb, values);
+        std::memcpy(state.blend, blendConstants, sizeof blendConstants);
+        state.blendSet = true;
+    }
     if (!fetches.empty()) {
         VkDeviceSize offset = upload.offset + vertexAt;
         vkCmdBindVertexBuffers(cb, 0, 1, &upload.buffer, &offset);
