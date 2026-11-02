@@ -25,7 +25,8 @@ render targets and resolves run in Vulkan. Pads, keyboard and mouse work,
 and so do saves: the game creates its save in
 `%APPDATA%\Skate3Native\saves`, loads it on the next boot, and plays the
 new-player flow (difficulty, camera, intro film, team and skater) into the
-skater editor. The 3D world isn't drawn right yet, and there's no sound. See
+skater editor, which renders the skater in 3D. The world hasn't been reached
+yet, there are no shadows, and there's no sound. See
 [docs/PHASE3.md](docs/PHASE3.md) for the details and what's next, and
 [docs/PHASE2.md](docs/PHASE2.md) for the recompilation work.
 

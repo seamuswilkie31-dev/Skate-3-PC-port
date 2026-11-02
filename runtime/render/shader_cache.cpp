@@ -3,6 +3,7 @@
 #include "memory.h"
 
 #include <algorithm>
+#include <array>
 #include <cstring>
 #include <fstream>
 #include <unordered_map>
@@ -84,16 +85,26 @@ uint64_t ShaderKey(const uint8_t* microcode, size_t size) {
     std::vector<size_t> fetches;
     size_t end = WalkClauses(microcode, size, fetches);
 
+    // Direct3D also writes the vertex fetches in the order of the vertex declaration, which
+    // needn't be the shader's, so they're hashed in an order of their own: sorted, each
+    // without its bound fields, one to each vertex fetch slot.
+    std::vector<size_t> vertexSlots;
+    std::vector<std::array<uint32_t, 3>> vertexFetches;
+    for (size_t slot : fetches) {
+        if (slot >= end || (word(3 * slot) & 0x1F) != 0) continue;
+        vertexSlots.push_back(slot);
+        std::array<uint32_t, 3>& f = vertexFetches.emplace_back();
+        for (int i = 0; i < 3; ++i) f[i] = word(3 * slot + i) & ~kBoundFetchFields[i];
+    }
+    std::sort(vertexFetches.begin(), vertexFetches.end());
+
     uint64_t hash = 0xCBF29CE484222325ull;
-    auto next = fetches.begin();
+    auto next = vertexSlots.begin();
     for (size_t s = 0; s < end; ++s) {
-        uint32_t w[3] = {word(3 * s), word(3 * s + 1), word(3 * s + 2)};
-        while (next != fetches.end() && *next < s) ++next;
-        bool vertexFetch = next != fetches.end() && *next == s && (w[0] & 0x1F) == 0;
-        for (int i = 0; i < 3; ++i) {
-            uint32_t value = vertexFetch ? w[i] & ~kBoundFetchFields[i] : w[i];
+        std::array<uint32_t, 3> w = {word(3 * s), word(3 * s + 1), word(3 * s + 2)};
+        if (next != vertexSlots.end() && *next == s) w = vertexFetches[next++ - vertexSlots.begin()];
+        for (uint32_t value : w)
             for (int shift = 24; shift >= 0; shift -= 8) hash = (hash ^ (value >> shift & 0xFF)) * 0x100000001B3ull;
-        }
     }
     return hash;
 }

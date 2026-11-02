@@ -29,8 +29,9 @@ struct Shader {
 
 // The identity of a shader's code: FNV-1a 64 over the instructions its control flow
 // executes, with the vertex fetch fields Direct3D fills in when it binds a vertex
-// declaration cleared. Leaves out anything after the last instruction (some shaders
-// carry a hash there, which bound copies don't always keep).
+// declaration cleared, and the vertex fetches taken in sorted order (Direct3D reorders
+// them). Leaves out anything after the last instruction (some shaders carry a hash there,
+// which bound copies don't always keep).
 uint64_t ShaderKey(const uint8_t* microcode, size_t size);
 
 // Loads shader_cache.bin. Returns the number of shaders, or 0 with `error` set.

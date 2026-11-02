@@ -82,13 +82,14 @@ layer reports nothing.
   unlock-all option.
 - **Profile settings aren't stored.** The game doesn't write any.
 - **The keyboard can't be typed on yet.** Dialogs take their defaults.
-- **The skater editor's 3D view:** the skater isn't drawn, and a white area
-  covers the lower left. That's rendering work.
+
+The skater editor's 3D view now renders too; see
+[PHASE3.md](PHASE3.md#rendering-in-game-the-skater-editor).
 
 ## Next
 
-1. **Rendering in game:** the skater editor's 3D view, then the world
-   ("Play Skate 3").
+1. **Rendering in game:** shadows (depth resolves), then the world ("Play
+   Skate 3").
 2. **The keyboard dialog with real typing**, in the window.
 3. **Your save and DLC:** STFS import in the launcher, mounted as content.
 4. **Audio** (phase 4): real XMA decoding and output.

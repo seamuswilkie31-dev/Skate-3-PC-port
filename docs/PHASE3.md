@@ -572,13 +572,79 @@ and textures. That's how the clear problem showed up.
 - **Speed:** vertices are converted on the CPU for every draw, and the
   barriers are coarse.
 
+## Rendering in game: the skater editor
+
+With saves working ([PHASE5.md](PHASE5.md)), the new-player flow reaches the
+skater editor. Its 3D view had two faults:
+- the skater wasn't drawn;
+- a white area covered the lower half.
+
+Three fixes:
+
+**1. Direct3D reorders vertex fetches.** The skater's meshes use five skinned
+vertex shaders (150–201 dwords), and none matched the cache. Their microcode
+matched a container in every instruction but two: the two vertex fetches had
+changed places. Direct3D writes a shader's fetches in the order of the vertex
+declaration it's bound to (here by offset in the vertex), and that needn't be
+the shader's order.
+- **`ShaderKey`** now hashes the vertex fetches sorted, each without its
+  bound fields, one to each fetch slot. Still 249 keys, still unambiguous.
+- **Inputs are matched by register.** An input's fetch is the one, among the
+  inputs' slots, that writes the register the container's fetch writes. Mini
+  fetches still take their buffer from the full fetch before them, in the
+  bound order.
+- **Direct3D's clear shader** has a new key, `CBE4133AF97083F3`.
+
+**2. The bound destination swizzle counts.** Once drawn, the skater lay on
+its side, with spikes for arms. Its positions and texture coordinates are
+16-bit pairs (`SHORT4N`, `SHORT2N`) in a big-endian buffer. The endian swap
+puts the first of each pair in the dword's high half, and the GPU takes x
+from the low half. So Direct3D binds the fetch with destination swizzle
+(y, x, w, z), and the runtime had been using the container's (x, y, z).
+- The raw data settled it. Read first-in-memory as x, the first mesh's
+  vertices sat at floor height (the shoes) and the second's at about 1.5 m
+  (the head). Read the other way, both sat at 0.9 m.
+- Vertex conversion now applies the bound swizzle: each fetched component
+  (or 0 or 1) goes where the container's swizzle makes the translated shader
+  look for it. Packed formats (8_8_8_8, 10_11_11) are bound with the
+  identity, so they're unchanged.
+
+**3. Tiled resolves.** The 3D view is drawn at 1152×640 with 2× MSAA, in two
+tiles of 320 rows, each resolved out on its own:
+- The first tile's resolve goes to `01AC1000`.
+- The second's goes to `01C29000`: 320 rows (1152 × 320 × 4 bytes) further
+  into the same texture, with the rectangle at EDRAM row 0.
+- So the GPU writes a resolve's rectangle at its EDRAM position, from the
+  destination address, and Direct3D moves the address for each tile.
+- The runtime had made a second texture for the second tile, so the real
+  texture's lower half stayed white. A destination address inside a resolve
+  texture (same width and format, a whole number of rows in) is now that
+  texture, at that row.
+
+**Diagnostics:** `--capture-frame` also logs each draw's vertex inputs:
+location, format, offset and stride.
+
+**Result.** The skater editor renders: the skater stands with the board,
+textured and lit, in front of its wall. Every screen before it still renders
+as before, and the title screen's 3D scene now shows its skater too. In a
+200-second run:
+
+| | Count |
+|---|---|
+| Draws | 625,505 through 51 pipelines, none skipped |
+| Unknown shaders | only Direct3D's point-list shader (no render target bound) |
+
+**Not done yet:**
+- **Depth resolves** are still skipped. Shadow maps are depth resolved to
+  `k_24_8` textures, and those are white for now, so there are no shadows.
+- **The world** ("Play Skate 3").
+
 ## Next
 
 1. **Input** (phase 4): done, see [PHASE4.md](PHASE4.md). Start and A now get
    the game past the title screen and its autosave notice, to the storage
    device prompt.
-2. **Rendering, continued:** the items above, and whatever the game draws
-   past the title screen (in game, the 3D world).
+2. **Rendering, continued:** depth resolves (shadows), then the world.
 3. **Audio output** (phase 4): real XMA decoding behind the same context
    interface, and the render driver's frames played through SDL3.
 4. **Saves and DLC** (phase 5): the hard drive and cache partitions, the

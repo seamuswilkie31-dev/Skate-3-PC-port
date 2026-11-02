@@ -51,6 +51,9 @@ constexpr uint32_t kSharedSize = 512;
 constexpr uint32_t kSpecAlphaTest = 1 << 1;
 constexpr uint32_t kStageConstantsSize = 256 * 16;  // one stage's float4 constants
 constexpr uint32_t kMaxVertices = 1u << 20;
+constexpr uint32_t kMaxAttributes = 16;
+constexpr uint32_t kNoRegister = ~0u;
+constexpr uint32_t kIdentitySwizzle = 0x688;  // x, y, z, w: 3 bits each
 
 enum Skip { kNoWindow, kEdramMode, kScreenSpace, kPrimitive, kIndices, kTooBig, kNoTarget, kViewport, kPipeline,
             kSkipCount };
@@ -63,9 +66,11 @@ std::atomic<uint64_t> gPipelineCount{0};
 
 // A vertex shader input and where it comes from.
 struct Element {
-    uint32_t address;  // the vertex fetch instruction's slot in the microcode
+    uint32_t address;  // the vertex fetch instruction's slot in the container's microcode
     uint32_t usage;
     uint32_t location;
+    uint32_t reg = kNoRegister;           // the register that fetch writes
+    uint32_t swizzle = kIdentitySwizzle;  // and its destination swizzle
 };
 
 // One vertex fetch, as Direct3D bound it.
@@ -80,6 +85,9 @@ struct Fetch {
     int32_t exponent;
     uint32_t stride;  // dwords
     int32_t offset;   // dwords
+    // Destination swizzles: the bound one, which says which fetched component (or 0 or 1)
+    // each register component gets, and the container's, which the translated shader uses.
+    uint32_t swizzle, shaderSwizzle;
 };
 
 struct PipelineKey {
@@ -87,8 +95,8 @@ struct PipelineKey {
     const Shader* pixelShader;
     uint32_t topology, restart;
     uint32_t attributeCount;
-    uint8_t locations[16];
-    uint8_t uintInputs[16];
+    uint8_t locations[kMaxAttributes];
+    uint8_t uintInputs[kMaxAttributes];
     VkFormat colorFormat;
     uint32_t samples;
     uint32_t depth;
@@ -182,7 +190,15 @@ const std::vector<Element>& VertexElements(const Shader* shader) {
             uint32_t usage = value >> 12 & 0xF, index = value >> 16 & 0xF;
             for (const UsageLocation& u : kUsageLocations) {
                 if (u.usage == usage && u.index == index) {
-                    elements.push_back({value & 0xFFF, usage, u.location});
+                    Element e{value & 0xFFF, usage, u.location};
+                    if (uint64_t(e.address) * 12 + 12 <= shader->microcodeSize) {
+                        uint32_t w0 = LoadBE32(shader->microcode, e.address * 12);
+                        if ((w0 & 0x1F) == 0) {
+                            e.reg = w0 >> 12 & 0x3F;
+                            e.swizzle = LoadBE32(shader->microcode, e.address * 12 + 4) & 0xFFF;
+                        }
+                    }
+                    elements.push_back(e);
                     break;
                 }
             }
@@ -193,18 +209,41 @@ const std::vector<Element>& VertexElements(const Shader* shader) {
 }
 
 // The fetches as bound: each element's vertex fetch instruction in the microcode the GPU
-// was given. A mini fetch reuses the buffer and stride of the full fetch before it.
+// was given. Direct3D writes the fetches in the order of the vertex declaration, which
+// needn't be the shader's, so an element's fetch is the one among the elements' slots that
+// writes its register. A mini fetch reuses the buffer and stride of the full fetch before it.
 void BoundFetches(const DrawCall& call, std::vector<Fetch>& fetches) {
     fetches.clear();
+    auto word = [&call](uint32_t slot, uint32_t i) { return LoadBE32(call.vertexMicrocode, slot * 12 + i * 4); };
+    auto inside = [&call](uint32_t slot) { return uint64_t(slot) * 12 + 12 <= call.vertexMicrocodeSize; };
+    const std::vector<Element>& elements = VertexElements(call.vertexShader);
+    std::pair<uint32_t, const Element*> bound[kMaxAttributes];
+    uint32_t count = 0;
+    for (const Element& e : elements) {
+        if (count == kMaxAttributes) break;
+        uint32_t slot = e.address;
+        for (const Element& other : elements) {
+            if (e.reg == kNoRegister || !inside(other.address)) continue;
+            uint32_t w0 = word(other.address, 0);
+            if ((w0 & 0x1F) == 0 && (w0 >> 12 & 0x3F) == e.reg) {
+                slot = other.address;
+                break;
+            }
+        }
+        bound[count++] = {slot, &e};
+    }
+    std::sort(bound, bound + count, [](auto& a, auto& b) { return a.first < b.first; });
+
     uint32_t constant = 0, stride = 0;
-    for (const Element& e : VertexElements(call.vertexShader)) {
+    for (uint32_t i = 0; i < count; ++i) {
+        auto [slot, element] = bound[i];
+        const Element& e = *element;
         Fetch f{};
         f.location = e.location;
         f.usage = e.usage;
-        if (uint64_t(e.address) * 12 + 12 <= call.vertexMicrocodeSize) {
-            uint32_t w0 = LoadBE32(call.vertexMicrocode, e.address * 12);
-            uint32_t w1 = LoadBE32(call.vertexMicrocode, e.address * 12 + 4);
-            uint32_t w2 = LoadBE32(call.vertexMicrocode, e.address * 12 + 8);
+        f.swizzle = f.shaderSwizzle = e.swizzle;
+        if (inside(slot)) {
+            uint32_t w0 = word(slot, 0), w1 = word(slot, 1), w2 = word(slot, 2);
             if ((w0 & 0x1F) == 0) {  // a vertex fetch
                 if (!(w1 >> 30 & 1)) {
                     constant = (w0 >> 20 & 0x1F) * 3 + (w0 >> 25 & 3);
@@ -222,6 +261,7 @@ void BoundFetches(const DrawCall& call, std::vector<Fetch>& fetches) {
                 f.exponent = SignExtend(w1 >> 24 & 0x3F, 6);
                 f.stride = stride;
                 f.offset = SignExtend(w2 >> 8 & 0x7FFFFF, 23);
+                f.swizzle = w1 & 0xFFF;
             }
         }
         fetches.push_back(f);
@@ -310,6 +350,20 @@ void Unpack(const Fetch& f, const uint32_t* w, float v[4]) {
         for (int i = 0; i < 4; ++i) v[i] = std::ldexp(v[i], f.exponent);
 }
 
+// A destination swizzle gives, for each register component, the fetched component (0-3), 0
+// (4) or 1 (5) it gets, or nothing (7). Direct3D sets the bound one for the declared type:
+// 16-bit pairs in a big-endian buffer come out of the endian swap high half first, so a
+// SHORT2 takes y, x. The translated shader reads its input through the container's swizzle,
+// so each value goes where that one looks for it.
+void Reswizzle(const Fetch& f, const float value[4], float input[4]) {
+    std::memcpy(input, value, 16);
+    for (int i = 0; i < 4; ++i) {
+        uint32_t from = f.swizzle >> (3 * i) & 7, to = f.shaderSwizzle >> (3 * i) & 7;
+        if (to > 3 || from > 5) continue;  // the shader writes a constant there, or nothing's written
+        input[to] = from < 4 ? value[from] : float(from - 4);
+    }
+}
+
 // Vertices [first, first + count) of every fetch, 16 bytes each, interleaved.
 void ConvertVertices(const std::vector<Fetch>& fetches, uint32_t first, uint32_t count, uint8_t* out) {
     uint32_t stride = uint32_t(fetches.size()) * 16;
@@ -328,13 +382,15 @@ void ConvertVertices(const std::vector<Fetch>& fetches, uint32_t first, uint32_t
                 }
                 Unpack(f, w, value);
             }
+            float input[4];
+            Reswizzle(f, value, input);
             uint8_t* destination = out + size_t(v) * stride + e * 16;
             if (f.usage == kUsageBlendIndices) {
                 uint32_t indices[4];
-                for (int i = 0; i < 4; ++i) indices[i] = uint32_t(std::max(value[i], 0.0f));
+                for (int i = 0; i < 4; ++i) indices[i] = uint32_t(std::max(input[i], 0.0f));
                 std::memcpy(destination, indices, 16);
             } else {
-                std::memcpy(destination, value, 16);
+                std::memcpy(destination, input, 16);
             }
         }
     }
@@ -564,7 +620,6 @@ void Draw(const DrawCall& call) {
 
     static thread_local std::vector<Fetch> fetches;
     BoundFetches(call, fetches);
-    if (fetches.size() > 16) fetches.resize(16);
     uint32_t vertexStride = uint32_t(fetches.size()) * 16;
 
     // Textures first: converting one records an upload.
@@ -694,12 +749,19 @@ void Draw(const DrawCall& call) {
                           (size & 0x1FFF) + 1, (size >> 13 & 0x1FFF) + 1, slots[s].texture);
             textureList += item;
         }
+        std::string inputList;  // location: format (n normalised, i integer; s signed), offset/stride in dwords
+        for (const Fetch& f : fetches) {
+            char item[64];
+            std::snprintf(item, sizeof item, " in%u=fmt%u%s%s%+d@%d/%u", f.location, f.format, f.isInteger ? "i" : "n",
+                          f.isSigned ? "s" : "", f.exponent, f.offset, f.stride);
+            inputList += item;
+        }
         kernel::Log("  capture: draw %016llX/%016llX prim %u count %u target %08X/%08X/%08X mode %u viewport (%.0f,%.0f "
-                    "%.0fx%.0f) scissor (%d,%d)-(%d,%d) blend %08X mask %X depth %08X%s\n",
+                    "%.0fx%.0f) scissor (%d,%d)-(%d,%d) blend %08X mask %X depth %08X%s%s\n",
                     call.vertexShader->containerHash, call.pixelShader->containerHash, primitive, count, surface,
                     Register(reg::kRbColorInfo), depthInfo, mode, viewport.x, viewport.y, viewport.width,
                     viewport.height, x0, y0, x1, y1, key.blendControl, key.colorMask, key.depthControl,
-                    textureList.c_str());
+                    textureList.c_str(), inputList.c_str());
     }
 
     // Record.

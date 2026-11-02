@@ -421,12 +421,37 @@ Image* FindTarget(uint32_t base, uint32_t pitch, uint32_t msaa, uint32_t format,
 
 namespace {
 
-// The texture a resolve writes at `address`, made (again) to fit.
+// Bytes per pixel of a resolve's destination format (RB_COPY_DEST_INFO's).
+uint32_t DestinationBytes(uint32_t format) {
+    switch (format) {
+    case 2: return 1;                                     // 8
+    case 3: case 4: case 10: case 24: case 30: return 2;  // 1_5_5_5, 5_6_5, 8_8, 16, 16 float
+    case 26: case 32: case 37: return 8;                  // 16_16_16_16, its float, 32_32 float
+    case 38: return 16;                                   // 32_32_32_32 float
+    default: return 4;
+    }
+}
+
+// The texture a resolve writes at `address`, made (again) to fit, and the row `address` is
+// at. A screen drawn in tiles is resolved a tile at a time, and Direct3D points each tile's
+// resolve at the tile's first row, inside the texture the first tile made.
 Image* DestinationTexture(uint32_t address, uint32_t width, uint32_t height, VkFormat format, uint32_t guestFormat,
-                          VkCommandBuffer cb) {
+                          VkCommandBuffer cb, int32_t& row) {
+    row = 0;
     Texture* texture = nullptr;
     for (Texture& t : gTextures)
         if (t.address == address) texture = &t;
+    if (!texture) {
+        uint32_t rowBytes = ((width + 31) & ~31u) * DestinationBytes(guestFormat);
+        for (Texture& t : gTextures) {
+            if (!t.image.image || t.image.width != width || t.image.format != format || address <= t.address) continue;
+            uint32_t offset = address - t.address;
+            if (offset % rowBytes == 0 && offset / rowBytes < t.image.height) {
+                row = int32_t(offset / rowBytes);
+                return &t.image;
+            }
+        }
+    }
     if (texture && texture->image.width == width && texture->image.height == height && texture->image.format == format) {
         texture->format = guestFormat;
         return &texture->image;
@@ -537,20 +562,21 @@ void ClearEdram(VkCommandBuffer cb, bool depth, uint32_t base, uint32_t pitch, u
     }
 }
 
-// Copies `edram` from the render target to the resolve's destination texture, where
-// `screen` is (the window offset only moved it in EDRAM).
-void CopyOut(VkCommandBuffer cb, Image& source, Rect edram, Rect screen) {
+// Copies `edram` from the render target to the resolve's destination texture, at the same
+// position from the destination's address.
+void CopyOut(VkCommandBuffer cb, Image& source, Rect edram) {
     EndRendering();
     uint32_t address = Register(reg::kRbCopyDestBase) & 0x1FFFFFFF;
     uint32_t destPitch = Register(reg::kRbCopyDestPitch);
     uint32_t width = destPitch & 0x3FFF, height = destPitch >> 16 & 0x3FFF;
     uint32_t format = Register(reg::kRbCopyDestInfo) >> 7 & 0x3F;
-    Image* dest = width && height ? DestinationTexture(address, width, height, source.format, format, cb) : nullptr;
+    int32_t row = 0;
+    Image* dest = width && height ? DestinationTexture(address, width, height, source.format, format, cb, row) : nullptr;
     if (!dest) {
         ++gSkippedResolves;
         return;
     }
-    int32_t sx = edram.x0, sy = edram.y0, dx = screen.x0, dy = screen.y0;
+    int32_t sx = edram.x0, sy = edram.y0, dx = edram.x0, dy = edram.y0 + row;
     int32_t w = edram.x1 - edram.x0, h = edram.y1 - edram.y0;
     if (sx < 0) dx -= sx, w += sx, sx = 0;
     if (sy < 0) dy -= sy, h += sy, sy = 0;
@@ -685,7 +711,7 @@ void Resolve() {
     }
     if (command != 3) {  // 3: clear only
         if (color)
-            CopyOut(cb, *color, edram, screen);
+            CopyOut(cb, *color, edram);
         else
             ++gSkippedResolves;  // depth resolves come later
     }
