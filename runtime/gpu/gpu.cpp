@@ -1,8 +1,10 @@
 #include "gpu/gpu.h"
 
+#include "gpu/registers.h"
 #include "kernel/kernel.h"
 #include "memory.h"
 #include "render/shader_cache.h"
+#include "render/targets.h"
 
 #include <windows.h>
 
@@ -121,6 +123,8 @@ std::atomic<uint64_t> gShaderLoads{0};
 std::atomic<uint64_t> gShaderHits{0};
 std::atomic<uint64_t> gDrawsWithShaders{0};
 std::atomic<uint64_t> gDrawsWithUnknown{0};
+std::atomic<uint64_t> gResolveDraws{0};  // draws in copy mode
+std::atomic<uint64_t> gClearDraws{0};    // Direct3D's clear rectangles
 std::array<std::atomic<uint64_t>, 64> gPrimitives{};  // draws by primitive type
 std::mutex gStatsMutex;
 std::unordered_map<uint64_t, uint64_t> gShaderPairs;  // vertex * 31 + pixel container hash -> draws
@@ -145,12 +149,28 @@ void LoadShader(uint32_t type, const uint8_t* microcode, uint32_t dwords) {
                     bound.key, dwords);
 }
 
+uint32_t ReadRegister(uint32_t index);
+
+// Direct3D's clear shader: bare microcode in its library (drawn by 82B53D40), so the
+// translated shaders don't have it. Its rectangles are cleared natively.
+constexpr uint64_t kDirect3DClearShader = 0x053B88DD5FD226F7ull;
+
 // VGT_DRAW_INITIATOR: primitive type (bits 0-5), index source (6-7: 0 index buffer,
 // 1 immediate, 2 auto), 32-bit indices (bit 11), index or vertex count (16-31).
 void RecordDraw(uint32_t initiator) {
     ++gDraws;
     ++gPrimitives[initiator & 0x3F];
     const BoundShader &vertex = gBound[0], &pixel = gBound[1];
+    if ((ReadRegister(reg::kRbModeControl) & 7) == reg::kEdramModeCopy) {  // a resolve, not a draw
+        ++gResolveDraws;
+        render::Resolve();
+        return;
+    }
+    if (vertex.loaded && !vertex.shader && vertex.key == kDirect3DClearShader) {
+        ++gClearDraws;
+        render::ClearRectangle();
+        return;
+    }
     if (!vertex.loaded || !pixel.loaded) return;
     std::lock_guard lock(gStatsMutex);
     if (vertex.shader && pixel.shader) {
@@ -445,7 +465,12 @@ bool ExecuteType3(Stream& s, uint32_t header, int depth) {
         LoadShader(type, reinterpret_cast<const uint8_t*>(code.data()), dwords);
         break;
     }
-    case kNop:
+    case kNop:  // VdSwap's marker (gpu.h) ends a frame
+        if (count >= 4 && s.Read() == kSwapMarker) {
+            uint32_t frontBuffer = s.Read(), width = s.Read(), height = s.Read();
+            render::Swap(frontBuffer, width, height);
+        }
+        break;
     case kMeInit:
     case kWaitForIdle:
     case kInvalidateState:
@@ -600,9 +625,10 @@ std::string Describe() {
                   gShaderLoads.load(), gShaderHits.load(), lock.owns_lock() ? gUnknownShaders.size() : size_t(0));
     out += line;
     std::snprintf(line, sizeof line,
-                  "  draws: %llu with both shaders known (%zu shader pairs), %llu with an unknown shader; by primitive "
-                  "type:",
-                  gDrawsWithShaders.load(), lock.owns_lock() ? gShaderPairs.size() : size_t(0), gDrawsWithUnknown.load());
+                  "  draws: %llu resolves, %llu Direct3D clears, %llu with both shaders known (%zu shader pairs), %llu "
+                  "with an unknown shader; by primitive type:",
+                  gResolveDraws.load(), gClearDraws.load(), gDrawsWithShaders.load(),
+                  lock.owns_lock() ? gShaderPairs.size() : size_t(0), gDrawsWithUnknown.load());
     out += line;
     for (uint32_t p = 0; p < gPrimitives.size(); ++p) {
         if (uint64_t n = gPrimitives[p]) {
@@ -614,7 +640,7 @@ std::string Describe() {
     if (lock.owns_lock()) {
         std::vector<std::pair<uint64_t, UnknownShader>> unknown(gUnknownShaders.begin(), gUnknownShaders.end());
         std::sort(unknown.begin(), unknown.end(), [](auto& a, auto& b) { return a.second.draws > b.second.draws; });
-        for (size_t i = 0; i < unknown.size() && i < 8; ++i) {
+        for (size_t i = 0; i < unknown.size() && i < 8 && unknown[i].second.draws; ++i) {
             const auto& [key, u] = unknown[i];
             std::snprintf(line, sizeof line, "    unknown %s shader %016llX (%u dwords): %llu loads, %llu draws; primitive types",
                           u.pixel ? "pixel" : "vertex", u.pixel ? ~key : key, u.dwords, u.loads, u.draws);
@@ -676,5 +702,9 @@ void SetInterruptCallback(uint32_t callback, uint32_t userData) {
 }
 
 void CountSwap() { ++gSwaps; }
+
+uint32_t Register(uint32_t index) { return ReadRegister(index); }
+
+uint8_t* PhysicalMemory(uint32_t address) { return Physical(address); }
 
 }  // namespace s3n::gpu

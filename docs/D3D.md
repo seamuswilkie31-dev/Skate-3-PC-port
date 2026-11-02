@@ -30,10 +30,10 @@ they do, then confirmed by counting calls during a 90-second boot.
 | `82B4C9B0` | fence | writes `EVENT_WRITE_SHD` | 15,081 |
 | `82B4CEF8` | insert callback: a CPU callback when the GPU gets there | `INTERRUPT` + `WAIT_REG_MEM`; once per swap from `82B5A110` | 9,498 |
 | `82B51800` | **draw** (the main one) | `DRAW_INDX`, `EVENT_WRITE_EXT`; sets shaders through `82B5C640` | 117,726 |
-| `82B55668` | **draw** with a full state flush | many packet types; calls `82B54F48` → `82B54830` | 61,806 |
+| `82B55668` | **resolve**: copies a render target out to memory | many packet types; draws a rectangle in the copy EDRAM mode; calls `82B54F48` → `82B54830` | 61,806 |
 | `82B54830` | draw (inner) | `DRAW_INDX`, `IM_LOAD_IMMEDIATE` | 57,357 |
 | `82B521B0` | **draw** | `DRAW_INDX`; sets shaders through `82B5C640` | 42,734 |
-| `82B53D40` | draw (inner, from `82B54028`) | `DRAW_INDX`, `DRAW_INDX_2` | 41,877 |
+| `82B53D40` | **clear** (inner, from `82B54028`) | `DRAW_INDX`, `DRAW_INDX_2`: a rectangle with the clear depth and colour in its vertices | 41,877 |
 | `82B525A8` | **draw** | `DRAW_INDX`; sets shaders through `82B5C640` | 1,914 |
 | `82B5C640` | **set shaders** for a draw | `IM_LOAD` + two `LOAD_ALU_CONSTANT`s (vertex and pixel constants) | 162,374 |
 | `82B5C3C0` | load shader constants | `LOAD_ALU_CONSTANT` | 324,748 |
@@ -41,8 +41,8 @@ they do, then confirmed by counting calls during a 90-second boot.
 | `82B5B0F0` | set constants | `SET_CONSTANT` | 82,753 |
 | `82B56F08` | **run a recorded command buffer** | `INDIRECT_BUFFER`; called by the game's render passes | 8,240 |
 
-The draw functions called by the game (`82B51800`, `82B521B0`, `82B525A8`,
-`82B55668`) are the device's draw entry points. Their callers are the game's
+The draw functions called by the game (`82B51800`, `82B521B0`, `82B525A8`)
+are the device's draw entry points, beside its resolve (`82B55668`). Their callers are the game's
 renderer at `0x827Cxxxx`–`0x827Exxxx` and `0x82A4xxxx`. Other library
 functions that write draw packets weren't called during boot: `82B53508`,
 `82B533B0`, `82B51C98`, `82B629B8`, `82B62B10`, `82B633C8`, `82B68D18`.
@@ -78,10 +78,14 @@ seconds, more than the library's draw functions emitted.
   rendering step 3).
 - **Direct3D's own shaders.** Three vertex shaders have no container in
   `shaders_final.big`:
-  - one for the rectangle lists drawn by `82B55668` (float2 positions);
-  - one for the rectangle lists drawn by `82B53D40`;
-  - one for the point lists inside recorded command buffers.
-  The rectangle lists look like clears and copies.
+  - resolve (`82B55668`): a rectangle list in the copy EDRAM mode, whose
+    three float2 vertices give the rectangle;
+  - clear (`82B53D40`): a rectangle list whose vertices carry x, y, the
+    depth and the RGBA colour;
+  - the point lists inside recorded command buffers, drawn with no render
+    target bound.
+  The runtime carries out resolves and clears natively (PHASE3.md, rendering
+  step 3).
 
 ## What this means for the renderer
 

@@ -432,17 +432,70 @@ like clears and copies. The run report now lists shader loads found, draws
 by whether their shaders are known, and the unknown shaders with their draw
 counts and primitive types.
 
+## Rendering, step 3 (second part): render targets, resolves and the front buffer
+
+**What the GPU does with a frame.** Logging the render-target registers at
+every draw of a 60-second boot showed the shape of a frame:
+- **The frame you see** is drawn into a 1280×720 target (no MSAA). It's then
+  resolved to physical `0x01E68000`, the address in VdSwap's fetch constant:
+  a tiled 1280×720 8888 texture, the front buffer.
+- **The 3D scene** is drawn at 1152×640 with 2× MSAA, in screen tiles. Each
+  tile is resolved out (colour and depth), clearing EDRAM as it goes.
+- **Smaller targets** are each resolved to their own texture: 640×360 with
+  4× MSAA, 320×180, 80 pixels wide, and 16-bit targets 1600 and 560 wide
+  (shadows or effects).
+- **Direct3D's own draws:**
+  - `82B55668` is Resolve: it draws in the copy EDRAM mode, and three float2
+    vertices give the rectangle.
+  - `82B53D40` is Clear: a rectangle list whose vertices carry the depth and
+    colour. The very first clear is 20% grey.
+  - The point lists inside recorded command buffers have no render target
+    bound, so they're left alone.
+
+**The backend** (`runtime/render/targets.cpp`) runs on the command
+processor's thread:
+- **Render targets:** a Vulkan image for each EDRAM base, pitch, MSAA mode
+  and format (17 during boot). The GPU has no render-target height, so each
+  image covers the EDRAM from its base on, up to 2048 rows.
+- **Clears:** Direct3D's clear rectangles and the clears a resolve asks for,
+  done as Vulkan attachment clears. These need dynamic rendering, so the
+  runtime now requires Vulkan 1.3.
+- **Resolves:** each copies (or MSAA-resolves) its rectangle into a texture
+  keyed by the destination address, at its screen position. The window
+  offset only moves a tile within EDRAM. Depth resolves are skipped for now.
+- **Swaps:** VdSwap writes a marker packet with the front buffer's address
+  and size. When the command processor reaches it, the backend copies that
+  texture into an output image, submits the frame and hands it to the
+  window, which scales it to fit. Two output images and timeline semaphores
+  keep either thread at most one frame ahead of the other.
+- **`--dump-frames n`** writes every nth frame to `<work>\frames` as a BMP,
+  so runs can be checked without watching them.
+
+**Result** (60-second boot):
+
+| | Count |
+|---|---|
+| Resolves | 34,129 (plus 8,633 depth resolves skipped) |
+| Direct3D clears | 29,594 |
+| Frames | 2,062, every one showing the front buffer |
+
+The frames are still black, and that's expected. Nothing but ordinary draws
+writes the 1280×720 target, so it stays black until draws are translated.
+To check the chain, that target was temporarily filled with a test colour,
+and the colour came out unchanged in the dumped frames. The Khronos
+validation layer reports no errors or warnings.
+
 ## Next
 
-1. **Rendering, step 3 (continued): first pixels.**
-   - **Direct3D's own shaders:** handle its rectangle lists natively (clears
-     and copies), and find out what the point lists in recorded command
-     buffers do.
-   - **Pipelines:** vertex input from the bound fetch instructions, render
-     state from the registers, constants and textures from the fetch and ALU
-     constants.
-   - **Render targets:** model render targets (EDRAM) and resolves.
-   - **Goal:** draw the EA intro and the title screen.
+1. **Rendering, step 3 (continued): draws.**
+   - **Pipelines:** built from the register state: vertex input from the
+     bound fetch instructions; blending, depth and culling; viewport and
+     scissor.
+   - **Data:** vertex and index buffers from guest memory (byte-swapped);
+     constants into XenosRecomp's constant buffers; textures (untiled and
+     converted) for its bindless arrays.
+   - **The rest of Direct3D's work:** depth resolves.
+   - **Goal:** the EA intro and the title screen in the window.
 2. **Input** (phase 4): pads through SDL3 (`XamInputGetState`), and keyboard
    and mouse mapped onto the same virtual pad (see the roadmap). That's what
    gets past "press Start".

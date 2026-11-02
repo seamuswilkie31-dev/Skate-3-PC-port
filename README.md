@@ -18,10 +18,11 @@ with real waits, events, mutexes, critical sections and timers. It reads its
 data from your ISO, drives an emulated GPU front end, and has an audio clock
 and a silent XMA decoder. Its whole boot sequence now runs: the EA intro,
 loading, then the title screen, where with no input it starts the
-attract-mode video. Every frame is presented in a Vulkan window. 391 of the
-game's 392 shaders translate to SPIR-V, and the runtime recognises them as the
-GPU loads them. Nothing is drawn yet (the window stays black), and there's
-no sound or input. See
+attract-mode video. 391 of the game's 392 shaders translate to SPIR-V, and
+the runtime recognises them as the GPU loads them. Its render targets,
+clears and resolves run in Vulkan, and each frame's front buffer goes to the
+window. Ordinary draws aren't translated yet, so the window stays black, and
+there's no sound or input. See
 [docs/PHASE3.md](docs/PHASE3.md) for the details and what's next, and
 [docs/PHASE2.md](docs/PHASE2.md) for the recompilation work.
 
@@ -33,11 +34,11 @@ no sound or input. See
 | `scripts/recomp.ps1` | ISO → `default.xex` → xexscan → 219 MB of C++, in the work folder |
 | XenonRecomp patches | 39 missing instruction forms, D3D half-float packs, the console's 50 MHz timebase, fixes; Skate 3 has 0 unrecognized instructions and 0 traps |
 | `scripts/test_recomp.ps1` | 110 instruction tests (344 checks) against a Python reference model |
-| Runtime (`s3native.exe`) | Runs the game's start-up natively: guest memory, loader, guest threads on host threads, kernel objects and waits, critical sections, timers, files from the disc, GPU front end (`runtime/gpu`), audio clock, silent XMA decoder (`runtime/apu`); 117 kernel functions implemented, logging stubs for the other 169 |
+| Runtime (`s3native.exe`) | Runs the game's start-up natively: guest memory, loader, guest threads on host threads, kernel objects and waits, critical sections, timers, files from the disc, GPU front end (`runtime/gpu`), Vulkan render targets, resolves and frames (`runtime/render`), audio clock, silent XMA decoder (`runtime/apu`); 117 kernel functions implemented, logging stubs for the other 169 |
 
 ## Requirements
 
-Windows 10 (1803 or later) or 11, x64, a Vulkan GPU, Visual Studio 2022
+Windows 10 (1803 or later) or 11, x64, a Vulkan 1.3 GPU, Visual Studio 2022
 Build Tools with the C++ workload and the "C++ Clang tools for Windows"
 component, the Vulkan SDK, Python 3, Git. CMake fetches SDL3 and Dear ImGui on
 first configure; `setup_tools.ps1` fetches XenonRecomp and XenosRecomp.
@@ -70,8 +71,9 @@ powershell -ExecutionPolicy Bypass -File scripts\build.ps1
    It reads game files from the ISO or folder chosen in the launcher, or
    from `--game <path>`. Other options: `--no-window`, `--xex <path>`,
    `--log <file>`, `--stall <seconds>`, `--time-limit <seconds>`,
-   `--watch <hex address>` to log every write to one guest word, and
-   `--watch-reads <hex address>` for reads too.
+   `--watch <hex address>` to log every write to one guest word,
+   `--watch-reads <hex address>` for reads too, and `--dump-frames <n>` to
+   save every nth frame to `%LOCALAPPDATA%\Skate3Native\frames` as a BMP.
 
 The launcher builds without any game files: `build.ps1 -Target s3launcher`.
 Settings live in `%APPDATA%\Skate3Native\config.ini`, saves in

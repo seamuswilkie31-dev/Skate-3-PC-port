@@ -6,7 +6,6 @@
 #include "gpu/gpu.h"
 #include "kernel/kernel.h"
 #include "memory.h"
-#include "render/presenter.h"
 
 #include <cstring>
 
@@ -138,17 +137,22 @@ PPC_FUNC(__imp__VdGetSystemCommandBuffer) {
     if (ctx.r4.u32) StoreBE32(base, ctx.r4.u32, 0x53334E01);
 }
 
-// void VdSwap(u32* ringSpace, void* fetchConstant, ..., u32* frontBuffer, u32* format,
-//             u32* colorSpace, u32* width, u32* height)
-// The title reserves 64 dwords in the ring buffer for the swap's GPU commands. Until
-// there's a renderer they're one no-op packet the command processor skips.
+// void VdSwap(u32* ringSpace, u32* fetchConstant, ...)
+// The title reserves 64 dwords in the ring buffer for the swap's GPU commands. They become
+// one no-op packet carrying gpu::kSwapMarker and the front buffer, so the frame is shown
+// when the GPU gets there. The front buffer is a texture: its fetch constant (6 dwords)
+// has the address in dword 1 (bits 12-31) and width - 1 and height - 1 in dword 2.
 PPC_FUNC(__imp__VdSwap) {
     Trace(ctx, "VdSwap", true);
-    uint32_t ringSpace = ctx.r3.u32;
+    uint32_t ringSpace = ctx.r3.u32, fetchConstant = ctx.r4.u32;
+    uint32_t address = LoadBE32(base, fetchConstant + 4) & 0xFFFFF000, size = LoadBE32(base, fetchConstant + 8);
     std::memset(base + ringSpace, 0, 64 * 4);
     StoreBE32(base, ringSpace, 0xC0000000 | (62u << 16) | (0x10u << 8));  // type 3 NOP, 63 dwords of payload
+    StoreBE32(base, ringSpace + 4, gpu::kSwapMarker);
+    StoreBE32(base, ringSpace + 8, address & 0x1FFFFFFF);
+    StoreBE32(base, ringSpace + 12, (size & 0x1FFF) + 1);
+    StoreBE32(base, ringSpace + 16, (size >> 13 & 0x1FFF) + 1);
     gpu::CountSwap();
-    render::NotifySwap();
 }
 
 // u32 VdInitializeScalerCommandBuffer(u32 sourceXY, u32 sourceWH, u32 outputXY, u32 outputWH,
