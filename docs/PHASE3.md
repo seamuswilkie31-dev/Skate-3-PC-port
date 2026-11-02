@@ -294,16 +294,51 @@ still placeholders, so input buffers never get consumed. The thread then
 spins through them, about 900 million calls in 90 seconds, while holding a
 lock. The render thread waits on that lock, and frames stop.
 
+## Done: a silent XMA decoder, and boot reaches the title screen
+
+`apu/xma.cpp` and `kernel/xma_imports.cpp` give the game the XMA decoder's
+interface:
+
+- **Contexts.** `XMACreateContext` hands out real contexts from a pool of
+  256 in physical memory. Its placeholder had returned none, so the game had
+  been driving context 0. Each context is 16 big-endian words of bit fields
+  in the hardware's layout: the two input buffers with their packet counts
+  and valid bits, the input read position in bits, and the output ring of
+  256-byte blocks with its read and write offsets.
+- **Functions.** The 17 `XMA*` functions the game imports read and set those
+  fields. Buffer addresses are stored as physical addresses, as the hardware
+  reads them.
+- **The decoder.** A thread visits the enabled contexts every millisecond.
+  When there's room in the output ring, it writes one 512-sample frame of
+  silence (8 blocks in stereo) and moves through the current input buffer at
+  4 frames per 2 KB packet. A used-up buffer has its valid bit cleared, and
+  the decoder switches to the other one, which is the handshake the game's
+  audio core waits for. Output only advances as fast as the game reads it,
+  so the game's own audio timing sets the pace.
+
+With it, the audio core streams instead of spinning, the render thread keeps
+its lock, and the boot sequence runs through. In two runs of 90 and 120
+seconds:
+- the game ran without stalling, presenting about 34 frames a second
+  (about 4,100 frames and 544,000 draws in two minutes);
+- it played the EA intro, finished loading, and then opened
+  `Attract_english_ntsc.vp6`, the attract-mode video the game plays when its
+  title screen sits idle.
+
+So boot reaches the "press Start" screen and waits for a button no one can
+press yet. It also probes the cache partition (`CACHE:\httpcache`), which
+isn't served, and carries on without it.
+
 ## Next
 
-1. **XMA** (phase 4). First a decoder that consumes input buffers and
-   produces silence, implementing the `XMA*` context functions over the
-   context structures in guest memory. That unblocks the boot sequence.
-   Real XMA decoding and output through SDL3 come after.
-2. **Rendering.** Translate the draws the command processor now sees:
+1. **Rendering.** Translate the draws the command processor now sees:
    shaders through XenosRecomp, the Vulkan backend, then `VdSwap` presenting
-   the front buffer in a window.
-3. **Input** (phase 4): pads through SDL3, and keyboard and mouse mapped onto
-   the same virtual pad (see the roadmap).
+   the front buffer in a window. The first frames to aim for are the EA intro
+   and the title screen.
+2. **Input** (phase 4): pads through SDL3 (`XamInputGetState`), and keyboard
+   and mouse mapped onto the same virtual pad (see the roadmap). That's what
+   gets past "press Start".
+3. **Audio output** (phase 4): real XMA decoding behind the same context
+   interface, and the render driver's frames played through SDL3.
 4. **Saves and DLC** (phase 5): the hard drive and cache partitions, the
    content APIs, and importing your save and DLC packages.

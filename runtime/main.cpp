@@ -8,6 +8,7 @@
 // threads run on host threads; imports we haven't implemented are logged stubs
 // returning 0. The run ends through kernel::Finish, which prints a report.
 
+#include "apu/xma.h"
 #include "config.h"
 #include "disc.h"
 #include "gpu/gpu.h"
@@ -64,13 +65,14 @@ int main(int argc, char** argv) {
         kernel::Log("s3native: can't map the GPU registers\n");
         return 1;
     }
-    // The XMA audio decoder's registers. Until audio (phase 4) they're plain memory, so
-    // the title's writes land somewhere and its reads see zeros.
+    // The XMA audio decoder's registers: plain memory, since the decoder is driven through
+    // the XMA* functions instead (apu/xma.cpp).
     constexpr uint32_t kAudioRegisters = 0x7FEA0000;
     if (!memory.Commit(kAudioRegisters, 0x10000)) {
         kernel::Log("s3native: can't map the audio registers\n");
         return 1;
     }
+    apu::InitXma(memory);
 
     LoadedGame game;
     if (!LoadGame(memory, xexPath, game, error)) {

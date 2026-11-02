@@ -12,16 +12,16 @@ will be built, and the phase plan.
 
 ## Status
 
-Phase 3 in progress. Skate 3's recompiled code runs natively on 23 guest
+Phase 3 in progress. Skate 3's recompiled code runs natively on 24 guest
 threads (render, loader, file-system, audio, movie, network and job threads)
 with real waits, events, mutexes, critical sections and timers. It reads its
-data from your ISO, drives an emulated GPU front end and has an audio clock.
-Its boot sequence runs without crashing: it plays the intro movie through,
-presenting over a thousand frames, until its audio core waits on the XMA
-decoder, which isn't emulated yet. None of it is drawn yet, and there's no
-sound or input. See [docs/PHASE3.md](docs/PHASE3.md) for the details and
-what's next, and [docs/PHASE2.md](docs/PHASE2.md) for the recompilation
-work.
+data from your ISO, drives an emulated GPU front end, and has an audio clock
+and a silent XMA decoder. Its whole boot sequence now runs: the EA intro,
+loading, then the title screen, where with no input it starts the
+attract-mode video. That's about 34 frames a second presented, but none of
+it is drawn yet, and there's no sound or input. See
+[docs/PHASE3.md](docs/PHASE3.md) for the details and what's next, and
+[docs/PHASE2.md](docs/PHASE2.md) for the recompilation work.
 
 | Piece | State |
 |---|---|
@@ -31,7 +31,7 @@ work.
 | `scripts/recomp.ps1` | ISO → `default.xex` → xexscan → 219 MB of C++, in the work folder |
 | XenonRecomp patches | 39 missing instruction forms, D3D half-float packs, the console's 50 MHz timebase, fixes; Skate 3 has 0 unrecognized instructions and 0 traps |
 | `scripts/test_recomp.ps1` | 110 instruction tests (344 checks) against a Python reference model |
-| Runtime (`s3native.exe`) | Runs the game's start-up natively: guest memory, loader, guest threads on host threads, kernel objects and waits, critical sections, timers, files from the disc, GPU front end (`runtime/gpu`), audio clock; 100 kernel functions implemented, logging stubs for the other 186 |
+| Runtime (`s3native.exe`) | Runs the game's start-up natively: guest memory, loader, guest threads on host threads, kernel objects and waits, critical sections, timers, files from the disc, GPU front end (`runtime/gpu`), audio clock, silent XMA decoder (`runtime/apu`); 117 kernel functions implemented, logging stubs for the other 169 |
 
 ## Requirements
 
