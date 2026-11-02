@@ -784,6 +784,32 @@ runtime's own compute shader:
 skipped. With the Khronos validation layer on, the only report is a warning
 that some depth-only passes' pixel shaders write colour.
 
+**Open question:** shadowed ground comes out pure black (0, 0, 0), next to
+sunlit concrete at about (240, 215, 190). The lit side looks right; whether
+the shadows should keep some ambient fill needs a reference to judge. The
+final pass's colour grading isn't the cause: it blends a 3D table in by
+`f_bTint`, which is 0, and the table is empty in memory.
+
+## Frame rate: VSync and the cap
+
+**How the game paces itself.** It shows a frame every second vertical blank:
+at the console's 60 Hz, that's 30 fps. A test with the vblank at 120 Hz:
+- **The menus** ran at 58 fps instead of 29.
+- **The game times itself by the clock.** It calls `KeQueryPerformanceFrequency`
+  once a frame, the usual sign of a timebase delta. With the skater idle, a
+  pedestrian crossed the screen in the same wall time (about 10 s) at 60 and
+  120 Hz. A frame-based game would have walked him twice as far.
+
+**The launcher's settings now apply:**
+- **Frame rate cap:** the vblank rate is twice the cap (30 fps is the
+  original 60 Hz). Unlimited is 1000 Hz. `--vblank-hz` overrides it.
+- **VSync:** on, frames wait for the display (FIFO). Off, the newest
+  finished frame is shown at once (MAILBOX, else IMMEDIATE).
+
+**Result:** with the launcher's default 60 fps cap, the menus run at 60. In
+Port Carverton the command processor's work (about 17 ms a frame) holds it at
+37–40 fps; reaching 60 needs a faster renderer.
+
 ## Next
 
 1. **Input** (phase 4): done, see [PHASE4.md](PHASE4.md). Start and A now get

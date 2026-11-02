@@ -619,6 +619,7 @@ void ReportRead(uint32_t index) {
 // Consumes the ring buffer: everything between our read index and the write index the
 // title stores in CP_RB_WPTR.
 HANDLE gProcessorThread = nullptr;  // for its CPU time in the report
+double gVblankRate = 60.0;          // vertical blanks a second
 
 void CommandProcessor() {
     gProcessorThread = OpenThread(THREAD_QUERY_LIMITED_INFORMATION, FALSE, GetCurrentThreadId());
@@ -643,9 +644,9 @@ void CommandProcessor() {
 }
 
 // Runs on a guest thread of its own: delivers interrupt packets as they come and a vertical
-// blank every 1/60 s, each by calling the title's callback.
+// blank at the vblank rate (60 Hz, like the console's display), each by calling the title's callback.
 void InterruptThread(PPCContext& ctx, uint8_t* base) {
-    constexpr auto kFrame = std::chrono::nanoseconds(1000000000 / 60);
+    const auto kFrame = std::chrono::nanoseconds(int64_t(1e9 / gVblankRate));
     Clock::time_point nextVblank = Clock::now() + kFrame;
     for (;;) {
         std::pair<uint32_t, uint32_t> interrupt;
@@ -753,6 +754,10 @@ std::string Describe() {
 }
 
 }  // namespace
+
+void SetVblankRate(double hz) {
+    if (hz >= 30.0 && hz <= 1000.0) gVblankRate = hz;
+}
 
 bool Init(GuestMemory& memory) {
     gMemory = &memory;

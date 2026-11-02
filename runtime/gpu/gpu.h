@@ -22,6 +22,10 @@ constexpr uint32_t kRegisterWindowSize = 0x10000;
 // Maps the register window and starts the command processor.
 bool Init(GuestMemory& memory);
 
+// Vertical blanks a second (60 by default, as on the console). The game paces its frames by
+// them. Call before the title starts.
+void SetVblankRate(double hz);
+
 // VdInitializeRingBuffer / VdEnableRingBufferRPtrWriteBack (physical addresses).
 void InitializeRingBuffer(uint32_t physical, uint32_t sizeLog2);
 void EnableReadPointerWriteBack(uint32_t physical, uint32_t blockSizeLog2);

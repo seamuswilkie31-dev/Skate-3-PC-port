@@ -13,6 +13,9 @@ namespace s3n::render {
 
 struct Image;
 
+// The launcher's VSync: frames wait for the display, or the newest is shown at once. Before Init.
+void SetVsync(bool vsync);
+
 // Opens the window and sets up Vulkan (render/vulkan.h). On failure, `error` says why.
 bool Init(std::string& error);
 

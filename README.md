@@ -80,7 +80,9 @@ powershell -ExecutionPolicy Bypass -File scripts\build.ps1
    every nth frame to `%LOCALAPPDATA%\Skate3Native\frames` as a BMP, and
    `--capture-frame <n>` to log every clear, resolve and draw of frame n.
    `--press <button:seconds,...>` presses pad buttons on a schedule (for
-   example `--press start:40,a:50`).
+   example `--press start:40,a:50`). `--profile-thread <n>` samples where
+   guest thread n spends its time, and `--vblank-hz <n>` overrides the
+   vertical blank rate the launcher's frame rate cap sets (twice the cap).
 
 Controls: any SDL3 pad (Xbox, PlayStation, Switch), or keyboard and mouse:
 WASD for the left stick, mouse movement for the right stick (flick-it),

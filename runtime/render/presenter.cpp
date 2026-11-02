@@ -35,6 +35,7 @@ struct Output {
 
 SDL_Window* gWindow = nullptr;
 VkSurfaceKHR gSurface = VK_NULL_HANDLE;
+bool gVsync = true;  // the launcher's VSync
 VkCommandPool gCommandPool = VK_NULL_HANDLE;
 VkSwapchainKHR gSwapchain = VK_NULL_HANDLE;
 VkExtent2D gExtent{};
@@ -91,6 +92,20 @@ bool PickGpu(std::string& error) {
     return vk.gpu != VK_NULL_HANDLE;
 }
 
+// With VSync, frames wait for the display (FIFO). Without, the newest finished frame is shown
+// at once: MAILBOX where there is one, else IMMEDIATE.
+VkPresentModeKHR PresentMode() {
+    if (gVsync) return VK_PRESENT_MODE_FIFO_KHR;
+    Vulkan& vk = Vk();
+    uint32_t count = 0;
+    vkGetPhysicalDeviceSurfacePresentModesKHR(vk.gpu, gSurface, &count, nullptr);
+    std::vector<VkPresentModeKHR> modes(count);
+    vkGetPhysicalDeviceSurfacePresentModesKHR(vk.gpu, gSurface, &count, modes.data());
+    for (VkPresentModeKHR wanted : {VK_PRESENT_MODE_MAILBOX_KHR, VK_PRESENT_MODE_IMMEDIATE_KHR})
+        if (std::find(modes.begin(), modes.end(), wanted) != modes.end()) return wanted;
+    return VK_PRESENT_MODE_FIFO_KHR;
+}
+
 void DestroySwapchain() {
     VkDevice device = Vk().device;
     for (VkSemaphore s : gRenderFinished) vkDestroySemaphore(device, s, nullptr);
@@ -132,7 +147,7 @@ bool CreateSwapchain(std::string& error) {
     info.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
     info.preTransform = caps.currentTransform;
     info.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
-    info.presentMode = VK_PRESENT_MODE_FIFO_KHR;  // vsync; the launcher's options come later
+    info.presentMode = PresentMode();
     info.clipped = VK_TRUE;
     if (!Check(vkCreateSwapchainKHR(vk.device, &info, nullptr, &gSwapchain), "vkCreateSwapchainKHR", error))
         return false;
@@ -283,6 +298,8 @@ std::string Describe() {
 }
 
 }  // namespace
+
+void SetVsync(bool vsync) { gVsync = vsync; }
 
 bool Init(std::string& error) {
     if (!SDL_Init(SDL_INIT_VIDEO)) {

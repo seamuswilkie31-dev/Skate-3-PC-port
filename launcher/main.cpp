@@ -441,8 +441,9 @@ private:
         OptionCombo("##fps", d.fpsCap,
                     {{30, "30 fps (original)"}, {60, "60 fps"}, {120, "120 fps"}, {240, "240 fps"}, {0, "Unlimited"}});
         ImGui::Indent(ImGui::GetFontSize() * 11);
-        Hint("The Xbox 360 game runs at 30 fps. Higher caps depend on the frame-timing fixes planned for roadmap "
-             "phase 6; until then the runtime keeps the game at a rate it handles correctly.");
+        Hint("The Xbox 360 game runs at 30 fps. It times itself by the clock, so a higher cap gives more frames, "
+             "not a faster game; how many you get depends on your PC. With VSync on, your display's refresh rate "
+             "caps it too.");
         ImGui::Unindent(ImGui::GetFontSize() * 11);
 
         ImGui::Dummy(ImVec2(0, ImGui::GetFontSize() * 0.5f));

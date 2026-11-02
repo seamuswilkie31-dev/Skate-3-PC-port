@@ -4,6 +4,7 @@
 //            [--stall <seconds>] [--time-limit <seconds>] [--watch <hex address>]
 //            [--watch-reads <hex address>] [--no-window] [--dump-frames <interval>]
 //            [--capture-frame <frame>] [--press <button:seconds,...>] [--profile-thread <n>]
+//            [--vblank-hz <n>]
 //
 // Loads the game, mounts its disc (--game, or the launcher's choice in config.ini),
 // opens the game window, starts the entry point on a guest main thread, and logs every
@@ -11,7 +12,8 @@
 // logged stubs returning 0. The run ends through kernel::Finish, which prints a report.
 // --dump-frames n writes every nth frame to <work>\frames as a BMP; --capture-frame n logs every
 // clear, resolve and draw of frame n; --press presses pad buttons on a schedule (input.h);
-// --profile-thread n samples where guest thread n spends its time.
+// --profile-thread n samples where guest thread n spends its time; --vblank-hz n overrides the
+// vertical blank rate the launcher's frame rate cap gives (twice the cap).
 
 #include "apu/xma.h"
 #include "config.h"
@@ -47,6 +49,7 @@ int main(int argc, char** argv) {
     std::string xexPath = DefaultWorkPath("game\\default.xex");
     std::string logPath = DefaultWorkPath("s3native.log");
     std::string gameSource, presses;
+    double vblankRate = 0.0;  // --vblank-hz, else from the launcher's frame rate cap
     bool window = true;
     kernel::Options options;
     for (int i = 1; i < argc; i += 2) {
@@ -66,6 +69,7 @@ int main(int argc, char** argv) {
         else if (key == "--capture-frame") render::CaptureFrame(std::strtoull(argv[i + 1], nullptr, 10));
         else if (key == "--dump-frames") render::DumpFrames(uint32_t(std::atoi(argv[i + 1])), DefaultWorkPath("frames"));
         else if (key == "--profile-thread") kernel::ProfileThread(uint32_t(std::atoi(argv[i + 1])));
+        else if (key == "--vblank-hz") vblankRate = std::atof(argv[i + 1]);
         else if (key == "--watch") options.watchAddress = uint32_t(std::strtoul(argv[i + 1], nullptr, 16));
         else if (key == "--watch-reads") {
             options.watchAddress = uint32_t(std::strtoul(argv[i + 1], nullptr, 16));
@@ -115,6 +119,11 @@ int main(int argc, char** argv) {
     Config config;
     LoadConfig(ConfigPath(), config);
     if (gameSource.empty()) gameSource = config.game.source;
+    // The game shows a frame every second vertical blank, as the console's did at 60 Hz for
+    // 30 fps, and times itself by the clock: so the frame rate cap is half the vblank rate.
+    if (vblankRate <= 0.0) vblankRate = config.display.fpsCap > 0 ? config.display.fpsCap * 2.0 : 1000.0;
+    gpu::SetVblankRate(vblankRate);
+    render::SetVsync(config.display.vsync);
     if (gameSource.empty()) {
         kernel::Log("s3native: no game disc; choose your ISO in the launcher or pass --game <iso or folder>\n");
         return 1;
