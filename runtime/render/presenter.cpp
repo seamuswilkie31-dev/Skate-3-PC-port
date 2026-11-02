@@ -349,8 +349,9 @@ bool Init(std::string& error) {
     enable.features.shaderInt64 = VK_TRUE;
     enable.features.shaderInt16 = supported.features.shaderInt16;
 
-    // The GPU's depth buffers are 24-bit depth with 8-bit stencil.
-    for (VkFormat format : {VK_FORMAT_D24_UNORM_S8_UINT, VK_FORMAT_D32_SFLOAT_S8_UINT}) {
+    // The GPU's depth buffers are 24-bit depth (or float depth) with 8-bit stencil. Float depth
+    // comes first: a depth resolve copies it out as 32-bit floats a shader can sample.
+    for (VkFormat format : {VK_FORMAT_D32_SFLOAT_S8_UINT, VK_FORMAT_D24_UNORM_S8_UINT}) {
         VkFormatProperties properties;
         vkGetPhysicalDeviceFormatProperties(vk.gpu, format, &properties);
         if (properties.optimalTilingFeatures & VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT) {

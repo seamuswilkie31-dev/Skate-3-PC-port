@@ -736,6 +736,25 @@ sampler states). Fixed; there are 14 again.
 washed-out white. What's left is mostly shadows: depth textures (`k_24_8`,
 from depth resolves) are still white.
 
+## Depth resolves
+
+Direct3D resolves depth as raw 32-bit texels (destination format 8888), and
+the texture fetch decides how they're read. Shadow maps are read as
+`k_24_8`, depth in x; the scene's depth is read as 8888 by the post effects.
+- **Depth buffers are float** (`D32_SFLOAT_S8_UINT`) where the GPU has it.
+  The hardware has a float depth format too.
+- **A depth resolve from a single-sample target** copies the rectangle's
+  depth through the upload ring (Vulkan copies depth to colour only by way of
+  a buffer) into an `R32_SFLOAT` texture, which shaders sample directly.
+- **Not right yet:** a texture read as 8888 gets depth, 0, 0, 1 rather than
+  the packed depth and stencil bytes; that needs a pass of our own. Depth
+  resolves from MSAA targets (the 3D scene's) are still skipped.
+
+**Result:** no texture fetch is unsupported any more, and nothing earlier
+changed. Shadows still don't show. The shadow maps are turned into a 16_16
+texture by the game's own passes before the world samples it, and that chain
+is the next thing to follow.
+
 ## Next
 
 1. **Input** (phase 4): done, see [PHASE4.md](PHASE4.md). Start and A now get

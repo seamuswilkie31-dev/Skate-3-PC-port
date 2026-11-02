@@ -570,6 +570,57 @@ void ClearEdram(VkCommandBuffer cb, bool depth, uint32_t base, uint32_t pitch, u
     }
 }
 
+// A resolve's rectangle, clipped to both images: from (sx, sy) in the render target to
+// (dx, dy) in the destination, which is at the same position, `row` rows down.
+bool ClampCopy(Rect edram, int32_t row, const Image& source, const Image& dest, int32_t& sx, int32_t& sy, int32_t& dx,
+               int32_t& dy, int32_t& w, int32_t& h) {
+    sx = edram.x0, sy = edram.y0, dx = edram.x0, dy = edram.y0 + row;
+    w = edram.x1 - edram.x0, h = edram.y1 - edram.y0;
+    if (sx < 0) dx -= sx, w += sx, sx = 0;
+    if (sy < 0) dy -= sy, h += sy, sy = 0;
+    if (dx < 0) sx -= dx, w += dx, dx = 0;
+    if (dy < 0) sy -= dy, h += dy, dy = 0;
+    w = std::min({w, int32_t(source.width) - sx, int32_t(dest.width) - dx});
+    h = std::min({h, int32_t(source.height) - sy, int32_t(dest.height) - dy});
+    return w > 0 && h > 0;
+}
+
+// Copies `edram` from a float depth target into the resolve's destination as 32-bit floats,
+// through the upload ring (Vulkan copies depth to colour only by way of a buffer). Direct3D
+// resolves depth as raw 32-bit texels and the texture fetch decides how they're read: shadow
+// maps as k_24_8, depth in x, which is what this gives. (Read as 8888, the GPU would give the
+// packed depth and stencil bytes; here it's depth, 0, 0, 1.)
+void CopyDepthOut(Image& source, Rect edram) {
+    EndRendering();
+    uint32_t address = Register(reg::kRbCopyDestBase) & 0x1FFFFFFF;
+    uint32_t destPitch = Register(reg::kRbCopyDestPitch);
+    uint32_t width = destPitch & 0x3FFF, height = destPitch >> 16 & 0x3FFF;
+    uint32_t format = Register(reg::kRbCopyDestInfo) >> 7 & 0x3F;
+    int32_t row = 0, sx, sy, dx, dy, w, h;
+    VkCommandBuffer cb = Commands();
+    Image* dest = width && height ? DestinationTexture(address, width, height, VK_FORMAT_R32_SFLOAT, format, cb, row) : nullptr;
+    if (!dest || !ClampCopy(edram, row, source, *dest, sx, sy, dx, dy, w, h)) {
+        ++gSkippedResolves;
+        return;
+    }
+    backend::Upload upload;
+    cb = backend::Allocate(VkDeviceSize(w) * h * 4, upload);
+    if (!cb) return;
+    VkBufferImageCopy region{};
+    region.bufferOffset = upload.offset;
+    region.imageSubresource = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1};
+    region.imageOffset = {sx, sy, 0};
+    region.imageExtent = {uint32_t(w), uint32_t(h), 1};
+    vkCmdCopyImageToBuffer(cb, source.image, VK_IMAGE_LAYOUT_GENERAL, upload.buffer, 1, &region);
+    FullBarrier(cb);
+    region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    region.imageOffset = {dx, dy, 0};
+    vkCmdCopyBufferToImage(cb, upload.buffer, dest->image, VK_IMAGE_LAYOUT_GENERAL, 1, &region);
+    FullBarrier(cb);
+    Operation();
+    ++gResolves;
+}
+
 // Copies `edram` from the render target to the resolve's destination texture, at the same
 // position from the destination's address.
 void CopyOut(VkCommandBuffer cb, Image& source, Rect edram) {
@@ -584,15 +635,8 @@ void CopyOut(VkCommandBuffer cb, Image& source, Rect edram) {
         ++gSkippedResolves;
         return;
     }
-    int32_t sx = edram.x0, sy = edram.y0, dx = edram.x0, dy = edram.y0 + row;
-    int32_t w = edram.x1 - edram.x0, h = edram.y1 - edram.y0;
-    if (sx < 0) dx -= sx, w += sx, sx = 0;
-    if (sy < 0) dy -= sy, h += sy, sy = 0;
-    if (dx < 0) sx -= dx, w += dx, dx = 0;
-    if (dy < 0) sy -= dy, h += dy, dy = 0;
-    w = std::min({w, int32_t(source.width) - sx, int32_t(dest->width) - dx});
-    h = std::min({h, int32_t(source.height) - sy, int32_t(dest->height) - dy});
-    if (w <= 0 || h <= 0) return;
+    int32_t sx, sy, dx, dy, w, h;
+    if (!ClampCopy(edram, row, source, *dest, sx, sy, dx, dy, w, h)) return;
     if (source.samples != VK_SAMPLE_COUNT_1_BIT) {
         VkImageResolve region{};
         region.srcSubresource = region.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
@@ -718,10 +762,17 @@ void Resolve() {
         color = FindTarget(info & 0xFFF, pitch, msaa, info >> 16 & 0xF, false, cb);
     }
     if (command != 3) {  // 3: clear only
+        Image* depth = nullptr;
+        if (source == 4) {
+            uint32_t info = Register(reg::kRbDepthInfo);
+            depth = FindTarget(info & 0xFFF, pitch, msaa, info >> 16 & 1, true, cb);
+        }
         if (color)
             CopyOut(cb, *color, edram);
+        else if (depth && depth->samples == VK_SAMPLE_COUNT_1_BIT && depth->format == VK_FORMAT_D32_SFLOAT_S8_UINT)
+            CopyDepthOut(*depth, edram);
         else
-            ++gSkippedResolves;  // depth resolves come later
+            ++gSkippedResolves;  // depth resolves from MSAA targets come later
     }
 
     // Clears after the copy: colour packed as ARGB, depth as 24-bit depth and stencil.
