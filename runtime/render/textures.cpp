@@ -214,27 +214,28 @@ VkComponentSwizzle Component(uint32_t select, const uint8_t channel[4]) {
     return select == 4 ? VK_COMPONENT_SWIZZLE_ZERO : VK_COMPONENT_SWIZZLE_ONE;
 }
 
-// The 2D slot of `image` seen through a fetch constant's swizzle (3 bits per output
-// component: x, y, z, w, then 0 and 1).
+// The slot of `image` seen through a fetch constant's swizzle (3 bits per output component:
+// x, y, z, w, then 0 and 1), in the 2D set, or the cube set for a six-layer image.
 uint32_t ViewSlot(const Image& image, uint64_t serial, uint32_t swizzle, const uint8_t channel[4]) {
     auto key = std::make_tuple(image.image, serial, swizzle);
     auto it = gViews.find(key);
     if (it != gViews.end()) return it->second.slot;
-    if (gNextSlot[0] >= kSlots[0]) {
+    uint32_t kind = image.layers == 6 ? 2 : 0;
+    if (gNextSlot[kind] >= kSlots[kind]) {
         ++gOutOfSlots;
         return 0;
     }
     VkImageViewCreateInfo info{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
     info.image = image.image;
-    info.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    info.viewType = kind ? VK_IMAGE_VIEW_TYPE_CUBE : VK_IMAGE_VIEW_TYPE_2D;
     info.format = image.format;
     info.components = {Component(swizzle & 7, channel), Component(swizzle >> 3 & 7, channel),
                        Component(swizzle >> 6 & 7, channel), Component(swizzle >> 9 & 7, channel)};
-    info.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    info.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, image.layers};
     View view;
     if (vkCreateImageView(Vk().device, &info, nullptr, &view.view) != VK_SUCCESS) return 0;
-    view.slot = gNextSlot[0]++;
-    WriteDescriptor(0, view.slot, view.view, VK_NULL_HANDLE);
+    view.slot = gNextSlot[kind]++;
+    WriteDescriptor(kind, view.slot, view.view, VK_NULL_HANDLE);
     gViews.emplace(key, view);
     return view.slot;
 }
@@ -376,9 +377,11 @@ namespace {
 
 Slots BindFetch(const uint32_t fetch[6]) {
     Slots slots;
-    if ((fetch[0] & 3) != 2) return slots;  // not a texture    slots.sampler = SamplerSlot(fetch);
+    if ((fetch[0] & 3) != 2) return slots;  // not a texture
+    slots.sampler = SamplerSlot(fetch);
     uint32_t dimension = fetch[5] >> 9 & 3;  // 1D, 2D (or stacked), 3D, cube
-    if (dimension > 1 || (fetch[1] >> 10 & 1)) {
+    bool cube = dimension == 3;
+    if (dimension == 2 || (fetch[1] >> 10 & 1)) {
         slots.kind = dimension == 2 ? 1 : dimension == 3 ? 2 : 0;  // white until those are converted
         return slots;
     }
@@ -410,6 +413,11 @@ Slots BindFetch(const uint32_t fetch[6]) {
     uint32_t pitchBlocks = std::max(pitch / info.block, blocksWide);
     size_t span = tiled ? size_t((pitchBlocks + 31) & ~31u) * ((blocksHigh + 31) & ~31u) * info.bytes
                         : size_t(pitchBlocks) * blocksHigh * info.bytes;
+    // A cube's six faces follow one another, each a 2D slice aligned to 4 KB, in Vulkan's
+    // order: +X, -X, +Y, -Y, +Z, -Z.
+    uint32_t faces = cube ? 6 : 1;
+    size_t faceStride = cube ? (span + 4095) & ~size_t(4095) : span;
+    span = faceStride * (faces - 1) + span;
     if (uint64_t(base) + span > 0x20000000) return slots;
 
     uint64_t key = uint64_t(base) << 32 ^ uint64_t(fetch[1] & 0xFF) << 24 ^ uint64_t(fetch[2]) * 0x9E3779B1ull ^
@@ -422,15 +430,17 @@ Slots BindFetch(const uint32_t fetch[6]) {
         texture.checkedFrame = frame;
         uint64_t hash = HashMemory(source, span);
         if (created || hash != texture.hash) {
-            size_t size = size_t(blocksWide) * blocksHigh * info.bytes;
+            size_t faceSize = size_t(blocksWide) * blocksHigh * info.bytes;
             Upload upload;
-            VkCommandBuffer cb = Allocate(size, upload);
+            VkCommandBuffer cb = Allocate(faceSize * faces, upload);
             if (!cb) return slots;
             EndRendering();
-            Convert(source, upload.data, blocksWide, blocksHigh, pitchBlocks, tiled, info.bytes, endian);
+            for (uint32_t face = 0; face < faces; ++face)
+                Convert(source + face * faceStride, upload.data + face * faceSize, blocksWide, blocksHigh, pitchBlocks, tiled,
+                        info.bytes, endian);
             std::string error;
             if (created && !CreateImage(texture.image, info.format, width, height, VK_SAMPLE_COUNT_1_BIT,
-                                        VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, cb, error)) {
+                                        VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, cb, error, faces)) {
                 kernel::Log("  textures: can't make a %ux%u texture: %s\n", width, height, error.c_str());
                 DestroyImage(texture.image);
                 gTextures.erase(it);
@@ -440,7 +450,7 @@ Slots BindFetch(const uint32_t fetch[6]) {
             region.bufferOffset = upload.offset;
             region.bufferRowLength = blocksWide * info.block;
             region.bufferImageHeight = blocksHigh * info.block;
-            region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+            region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, faces};
             region.imageExtent = {width, height, 1};
             vkCmdCopyBufferToImage(cb, upload.buffer, texture.image.image, VK_IMAGE_LAYOUT_GENERAL, 1, &region);
             FullBarrier(cb);
@@ -448,6 +458,7 @@ Slots BindFetch(const uint32_t fetch[6]) {
             texture.hash = hash;
         }
     }
+    slots.kind = cube ? 2 : 0;
     slots.texture = ViewSlot(texture.image, 0, swizzle, info.channel);
     return slots;
 }

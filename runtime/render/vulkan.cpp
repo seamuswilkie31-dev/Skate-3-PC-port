@@ -14,11 +14,12 @@ bool Check(VkResult result, const char* what, std::string& error) {
 }
 
 bool CreateImage(Image& image, VkFormat format, uint32_t width, uint32_t height, VkSampleCountFlagBits samples,
-                 VkImageUsageFlags usage, VkCommandBuffer cb, std::string& error) {
+                 VkImageUsageFlags usage, VkCommandBuffer cb, std::string& error, uint32_t layers) {
     Vulkan& vk = Vk();
     image.format = format;
     image.width = width;
     image.height = height;
+    image.layers = layers;
     image.samples = samples;
     bool depth = format == VK_FORMAT_D24_UNORM_S8_UINT || format == VK_FORMAT_D32_SFLOAT_S8_UINT;
     image.aspect = depth ? VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT : VK_IMAGE_ASPECT_COLOR_BIT;
@@ -28,7 +29,8 @@ bool CreateImage(Image& image, VkFormat format, uint32_t width, uint32_t height,
     info.format = format;
     info.extent = {width, height, 1};
     info.mipLevels = 1;
-    info.arrayLayers = 1;
+    info.arrayLayers = layers;
+    if (layers == 6) info.flags = VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT;
     info.samples = samples;
     info.tiling = VK_IMAGE_TILING_OPTIMAL;
     info.usage = usage;
@@ -92,7 +94,7 @@ void Transition(VkCommandBuffer cb, VkImage image, VkImageAspectFlags aspect, Vk
     barrier.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
     barrier.srcQueueFamilyIndex = barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     barrier.image = image;
-    barrier.subresourceRange = {aspect, 0, 1, 0, 1};
+    barrier.subresourceRange = {aspect, 0, 1, 0, VK_REMAINING_ARRAY_LAYERS};
     vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0,
                          nullptr, 1, &barrier);
 }

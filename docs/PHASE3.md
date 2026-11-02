@@ -719,6 +719,23 @@ frame capture now also logs each texture's dimension.
 **Still white:** cube maps (the environment maps reflective surfaces add,
 258 bindings a frame) and depth textures (shadow maps, 278 a frame).
 
+## Cube maps, and samplers again
+
+**Cube maps.** The buildings came out nearly white: their environment maps
+were bound as the white stand-in, and reflective surfaces add them on top.
+- A cube texture's six faces follow one another in memory, each a 2D slice
+  aligned to 4 KB, in Vulkan's own order (+X, −X, +Y, −Y, +Z, −Z).
+- They're converted into a six-layer, cube-compatible image, and get a cube
+  view in the cube descriptor set the translated shaders sample.
+
+**Samplers.** The texture-binding memo in the speed work lost a line: every
+texture was being sampled with the default sampler (the report showed 0
+sampler states). Fixed; there are 14 again.
+
+**Result:** the buildings show their textures and windows instead of
+washed-out white. What's left is mostly shadows: depth textures (`k_24_8`,
+from depth resolves) are still white.
+
 ## Next
 
 1. **Input** (phase 4): done, see [PHASE4.md](PHASE4.md). Start and A now get
