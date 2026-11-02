@@ -68,6 +68,21 @@ Not all of Skate 3's GPU work goes through the library's draw functions:
 In total, the command processor counted about 464,000 draw packets in those 90
 seconds, more than the library's draw functions emitted.
 
+## Shaders as the GPU gets them
+
+- **Bound vertex shaders.** Before a vertex shader reaches the GPU, Direct3D
+  binds it to the vertex declaration. It writes the fetch constant, prefetch
+  count, format, stride and offset into each vertex fetch instruction; the
+  container's vertex elements say which instructions those are. The runtime
+  identifies shaders by a key that ignores those fields (PHASE3.md,
+  rendering step 3).
+- **Direct3D's own shaders.** Three vertex shaders have no container in
+  `shaders_final.big`:
+  - one for the rectangle lists drawn by `82B55668` (float2 positions);
+  - one for the rectangle lists drawn by `82B53D40`;
+  - one for the point lists inside recorded command buffers.
+  The rectangle lists look like clears and copies.
+
 ## What this means for the renderer
 
 There are two ways to drive Vulkan.
@@ -79,8 +94,8 @@ partly does.
 - **Coverage:** it sees every draw, whether it comes from the library, a
   replayed command buffer or the game's own packets.
 - **Shaders:** the 391 translated shaders still apply. A shader load names
-  the microcode, which is inside the container the cache was built from, so
-  a microcode hash maps to the SPIR-V.
+  the microcode, which matches the code in its container once the fields
+  Direct3D binds are ignored, so it leads to the SPIR-V.
 - **Cost:** the GPU's render targets (EDRAM) and resolves have to be
   modelled, and resolution scaling has to be built into that model.
 

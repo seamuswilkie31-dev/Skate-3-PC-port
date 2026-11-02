@@ -4,7 +4,8 @@
 #   powershell -ExecutionPolicy Bypass -File scripts\shaders.ps1 [-Iso <Skate 3 ISO or folder>]
 #
 # Without -Iso it uses the game you picked in the launcher. Needs XenosRecomp built
-# (scripts\setup_tools.ps1). The cache lands in <work>\shaders\shader_cache.cpp.
+# (scripts\setup_tools.ps1). The runtime loads <work>\shaders\shader_cache.bin;
+# shader_cache.cpp beside it is XenosRecomp's compiled-in form, kept for reference.
 param([string]$Iso, [string]$Work = "$env:LOCALAPPDATA\Skate3Native")
 $ErrorActionPreference = 'Stop'
 
@@ -40,4 +41,6 @@ $cache = Join-Path $shaders 'shader_cache.cpp'
 Write-Host 'XenosRecomp: translating shaders (a minute or two)...'
 & $recomp $source $cache $common | Where-Object { $_ -notmatch 'Recompiling shaders' }
 if ($LASTEXITCODE) { throw "XenosRecomp failed (exit $LASTEXITCODE)" }
-Write-Host "Done: $cache"
+$runtimeCache = Join-Path $shaders 'shader_cache.bin'
+Move-Item -Force "$cache.bin" $runtimeCache
+Write-Host "Done: $runtimeCache"

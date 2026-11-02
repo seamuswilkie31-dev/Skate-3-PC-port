@@ -2,9 +2,11 @@
 
 #include "kernel/kernel.h"
 #include "memory.h"
+#include "render/shader_cache.h"
 
 #include <windows.h>
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -13,6 +15,7 @@
 #include <deque>
 #include <mutex>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 namespace s3n::gpu {
@@ -99,6 +102,70 @@ std::array<std::atomic<bool>, 128> gOpcodeLogged{};
 std::atomic<uint32_t> gWaitingOn{0};  // WAIT_REG_MEM target while the processor waits, else 0
 std::atomic<bool> gWaitingOnMemory{false};
 uint32_t gTracePackets = 0;  // S3N_GPU_TRACE=<n>: log the first n packets in full
+
+// Shaders and draws, as the command processor sees them. The bound shaders are its own;
+// the tables are shared with the report (gStatsMutex).
+struct BoundShader {
+    bool loaded = false;
+    uint64_t key = 0;
+    render::Shader* shader = nullptr;  // nullptr: not in the shader cache
+};
+BoundShader gBound[2];  // vertex, pixel
+struct UnknownShader {
+    bool pixel;
+    uint32_t dwords;
+    uint64_t loads, draws;
+    uint64_t primitives;  // bit per primitive type drawn with
+};
+std::atomic<uint64_t> gShaderLoads{0};
+std::atomic<uint64_t> gShaderHits{0};
+std::atomic<uint64_t> gDrawsWithShaders{0};
+std::atomic<uint64_t> gDrawsWithUnknown{0};
+std::array<std::atomic<uint64_t>, 64> gPrimitives{};  // draws by primitive type
+std::mutex gStatsMutex;
+std::unordered_map<uint64_t, uint64_t> gShaderPairs;  // vertex * 31 + pixel container hash -> draws
+std::unordered_map<uint64_t, UnknownShader> gUnknownShaders;  // by key (pixel shaders' keys inverted)
+
+void LoadShader(uint32_t type, const uint8_t* microcode, uint32_t dwords) {
+    ++gShaderLoads;
+    bool pixel = type != 0;
+    BoundShader& bound = gBound[pixel];
+    bound.loaded = true;
+    bound.key = render::ShaderKey(microcode, size_t(dwords) * 4);
+    bound.shader = render::FindShader(bound.key, pixel);
+    if (bound.shader) {
+        ++gShaderHits;
+        return;
+    }
+    std::lock_guard lock(gStatsMutex);
+    auto [it, inserted] = gUnknownShaders.try_emplace(pixel ? ~bound.key : bound.key, UnknownShader{pixel, dwords, 0, 0, 0});
+    ++it->second.loads;
+    if (inserted && gUnknownShaders.size() <= 8)
+        kernel::Log("  gpu: %s shader %016llX (%u dwords) isn't in the shader cache\n", pixel ? "pixel" : "vertex",
+                    bound.key, dwords);
+}
+
+// VGT_DRAW_INITIATOR: primitive type (bits 0-5), index source (6-7: 0 index buffer,
+// 1 immediate, 2 auto), 32-bit indices (bit 11), index or vertex count (16-31).
+void RecordDraw(uint32_t initiator) {
+    ++gDraws;
+    ++gPrimitives[initiator & 0x3F];
+    const BoundShader &vertex = gBound[0], &pixel = gBound[1];
+    if (!vertex.loaded || !pixel.loaded) return;
+    std::lock_guard lock(gStatsMutex);
+    if (vertex.shader && pixel.shader) {
+        ++gDrawsWithShaders;
+        ++gShaderPairs[vertex.shader->containerHash * 31 + pixel.shader->containerHash];
+        return;
+    }
+    ++gDrawsWithUnknown;
+    for (UnknownShader* u : {vertex.shader ? nullptr : &gUnknownShaders[vertex.key],
+                             pixel.shader ? nullptr : &gUnknownShaders[~pixel.key]}) {
+        if (!u) continue;
+        ++u->draws;
+        u->primitives |= 1ull << (initiator & 0x3F);
+    }
+}
 
 uint8_t* Physical(uint32_t address) { return gMemory->Physical(address & 0x1FFFFFFF); }
 
@@ -359,15 +426,28 @@ bool ExecuteType3(Stream& s, uint32_t header, int depth) {
     case kSetBinSelectLo: gBinSelect = (gBinSelect & ~0xFFFFFFFFull) | s.Read(); break;
     case kSetBinSelectHi: gBinSelect = (gBinSelect & 0xFFFFFFFFull) | uint64_t(s.Read()) << 32; break;
     case kDrawIndx:
-    case kDrawIndx2:
-        ++gDraws;
+    case kDrawIndx2: {
+        if (opcode == kDrawIndx) s.Read();  // visibility query condition
+        RecordDraw(s.Read());
         LogOpcodeOnce(opcode, count, "draw");
         break;
+    }
+    case kImLoad: {  // shader microcode in memory: address | type, then start << 16 | dwords
+        uint32_t addressType = s.Read(), startSize = s.Read();
+        LoadShader(addressType & 3, Physical(addressType & ~3u), startSize & 0xFFFF);
+        break;
+    }
+    case kImLoadImmediate: {  // the same, with the microcode in the packet
+        uint32_t type = s.Read(), startSize = s.Read();
+        uint32_t dwords = std::min(startSize & 0xFFFF, count - 2);
+        std::vector<uint32_t> code(dwords);
+        for (uint32_t& word : code) word = __builtin_bswap32(s.Read());  // back to the stored byte order
+        LoadShader(type, reinterpret_cast<const uint8_t*>(code.data()), dwords);
+        break;
+    }
     case kNop:
     case kMeInit:
     case kWaitForIdle:
-    case kImLoad:
-    case kImLoadImmediate:
     case kInvalidateState:
     case kVizQuery:
     case kContextUpdate:
@@ -514,6 +594,38 @@ std::string Describe() {
         std::snprintf(line, sizeof line, "  waiting on %s %08X\n", gWaitingOnMemory ? "memory" : "register", target);
         out += line;
     }
+    // The tables, unless the command processor was stopped holding them.
+    std::unique_lock lock(gStatsMutex, std::try_to_lock);
+    std::snprintf(line, sizeof line, "  shaders: %llu loads, %llu found in the cache; %zu unknown shaders\n",
+                  gShaderLoads.load(), gShaderHits.load(), lock.owns_lock() ? gUnknownShaders.size() : size_t(0));
+    out += line;
+    std::snprintf(line, sizeof line,
+                  "  draws: %llu with both shaders known (%zu shader pairs), %llu with an unknown shader; by primitive "
+                  "type:",
+                  gDrawsWithShaders.load(), lock.owns_lock() ? gShaderPairs.size() : size_t(0), gDrawsWithUnknown.load());
+    out += line;
+    for (uint32_t p = 0; p < gPrimitives.size(); ++p) {
+        if (uint64_t n = gPrimitives[p]) {
+            std::snprintf(line, sizeof line, " %u=%llu", p, n);
+            out += line;
+        }
+    }
+    out += "\n";
+    if (lock.owns_lock()) {
+        std::vector<std::pair<uint64_t, UnknownShader>> unknown(gUnknownShaders.begin(), gUnknownShaders.end());
+        std::sort(unknown.begin(), unknown.end(), [](auto& a, auto& b) { return a.second.draws > b.second.draws; });
+        for (size_t i = 0; i < unknown.size() && i < 8; ++i) {
+            const auto& [key, u] = unknown[i];
+            std::snprintf(line, sizeof line, "    unknown %s shader %016llX (%u dwords): %llu loads, %llu draws; primitive types",
+                          u.pixel ? "pixel" : "vertex", u.pixel ? ~key : key, u.dwords, u.loads, u.draws);
+            out += line;
+            for (uint32_t p = 0; p < 64; ++p) {
+                if (u.primitives >> p & 1) out += " " + std::to_string(p);
+            }
+            out += "\n";
+        }
+    }
+    if (lock.owns_lock()) lock.unlock();
     out += "  packets:";
     std::snprintf(line, sizeof line, " regs=%llu", gType0.load());
     out += line;

@@ -1,0 +1,80 @@
+diff --git a/XenosRecomp/main.cpp b/XenosRecomp/main.cpp
+index d547180..3c56318 100644
+--- a/XenosRecomp/main.cpp
++++ b/XenosRecomp/main.cpp
+@@ -27,8 +27,58 @@ struct RecompiledShader
+     IDxcBlob* dxil = nullptr;
+     std::vector<uint8_t> spirv;
+     uint32_t specConstantsMask = 0;
++    std::vector<uint8_t> rawSpirv;  // Skate 3 Native: for the runtime's binary cache
+ };
+ 
++// Skate 3 Native: a cache the runtime loads at start-up instead of compiling one in.
++// It keeps each container whole, since the runtime finds a shader by its microcode.
++//
++// shader_cache.bin, little-endian: "S3NS", version, entry count, reserved; then per entry
++// container hash, flags (bit 0: pixel shader), spec constant mask, container offset and
++// size, SPIR-V offset and size; then the data they point at.
++static void writeRuntimeCache(const char* path, const std::map<XXH64_hash_t, RecompiledShader>& shaders)
++{
++    struct Entry
++    {
++        uint64_t containerHash;
++        uint32_t flags, specConstantsMask, containerOffset, containerSize, spirvOffset, spirvSize;
++    };
++    std::vector<Entry> entries;
++    std::vector<uint8_t> blob;
++    for (auto& [hash, shader] : shaders)
++    {
++        if (shader.rawSpirv.empty())
++            continue;
++        auto container = reinterpret_cast<const ShaderContainer*>(shader.data);
++        uint32_t containerSize = container->virtualSize + container->physicalSize;
++        Entry e{};
++        e.containerHash = hash;
++        e.flags = (container->flags & 1) == 0 ? 1 : 0;
++        e.specConstantsMask = shader.specConstantsMask;
++        e.containerOffset = uint32_t(blob.size());
++        e.containerSize = containerSize;
++        blob.insert(blob.end(), shader.data, shader.data + containerSize);
++        while (blob.size() % 4) blob.push_back(0);
++        e.spirvOffset = uint32_t(blob.size());
++        e.spirvSize = uint32_t(shader.rawSpirv.size());
++        blob.insert(blob.end(), shader.rawSpirv.begin(), shader.rawSpirv.end());
++        entries.push_back(e);
++    }
++    uint32_t header[4] = { 0x534E3353, 1, uint32_t(entries.size()), 0 };  // "S3NS"
++    uint32_t base = sizeof(header) + uint32_t(entries.size() * sizeof(Entry));
++    for (Entry& e : entries)
++    {
++        e.containerOffset += base;
++        e.spirvOffset += base;
++    }
++    FILE* file = fopen(path, "wb");
++    fwrite(header, sizeof(header), 1, file);
++    fwrite(entries.data(), sizeof(Entry), entries.size(), file);
++    fwrite(blob.data(), 1, blob.size(), file);
++    fclose(file);
++    fmt::println("Runtime cache: {} shaders in {}", entries.size(), path);
++}
++
+ int main(int argc, char** argv)
+ {
+ #ifndef XENOS_RECOMP_INPUT
+@@ -142,6 +192,8 @@ int main(int argc, char** argv)
+                     return;
+                 }
+ 
++                shader.rawSpirv.assign(reinterpret_cast<uint8_t*>(spirv->GetBufferPointer()),
++                    reinterpret_cast<uint8_t*>(spirv->GetBufferPointer()) + spirv->GetBufferSize());
+                 bool result = smolv::Encode(spirv->GetBufferPointer(), spirv->GetBufferSize(), shader.spirv, smolv::kEncodeFlagStripDebugInfo);
+                 assert(result);
+ 
+@@ -217,6 +269,7 @@ int main(int argc, char** argv)
+         fmt::println("{} of {} shaders in the cache", entryCount, shaders.size());
+ 
+         writeAllBytes(output, f.out.data(), f.out.size());
++        writeRuntimeCache((std::string(output) + ".bin").c_str(), shaders);
+     }
+     else
+     {

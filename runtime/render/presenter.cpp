@@ -1,6 +1,7 @@
 #include "render/presenter.h"
 
 #include "kernel/kernel.h"
+#include "render/shader_cache.h"
 
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_vulkan.h>
@@ -46,6 +47,7 @@ std::condition_variable gSwapWake;
 uint64_t gSwapsPending = 0;
 std::atomic<uint64_t> gSwaps{0};
 std::atomic<uint64_t> gPresented{0};
+size_t gShaderModules = 0;
 
 bool Check(VkResult result, const char* what, std::string& error) {
     if (result == VK_SUCCESS) return true;
@@ -252,6 +254,31 @@ bool Init(std::string& error) {
     }
     if (!PickGpu(error)) return false;
 
+    // The translated shaders read constants through buffer device addresses and index
+    // textures and samplers in bindless arrays (XenosRecomp's interface).
+    VkPhysicalDeviceVulkan12Features supported12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
+    VkPhysicalDeviceFeatures2 supported{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+    supported.pNext = &supported12;
+    vkGetPhysicalDeviceFeatures2(gGpu, &supported);
+    if (!supported12.bufferDeviceAddress || !supported12.descriptorIndexing || !supported12.runtimeDescriptorArray ||
+        !supported12.descriptorBindingPartiallyBound || !supported12.descriptorBindingSampledImageUpdateAfterBind ||
+        !supported.features.shaderInt64) {
+        error = gGpuName + " lacks Vulkan features the shaders need (buffer device address, descriptor indexing, 64-bit ints)";
+        return false;
+    }
+    VkPhysicalDeviceVulkan12Features enable12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
+    enable12.bufferDeviceAddress = VK_TRUE;
+    enable12.descriptorIndexing = VK_TRUE;
+    enable12.runtimeDescriptorArray = VK_TRUE;
+    enable12.descriptorBindingPartiallyBound = VK_TRUE;
+    enable12.descriptorBindingVariableDescriptorCount = supported12.descriptorBindingVariableDescriptorCount;
+    enable12.descriptorBindingSampledImageUpdateAfterBind = VK_TRUE;
+    enable12.shaderSampledImageArrayNonUniformIndexing = supported12.shaderSampledImageArrayNonUniformIndexing;
+    VkPhysicalDeviceFeatures2 enable{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+    enable.pNext = &enable12;
+    enable.features.shaderInt64 = VK_TRUE;
+    enable.features.shaderInt16 = supported.features.shaderInt16;
+
     float priority = 1.0f;
     VkDeviceQueueCreateInfo queueInfo{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
     queueInfo.queueFamilyIndex = gQueueFamily;
@@ -259,12 +286,27 @@ bool Init(std::string& error) {
     queueInfo.pQueuePriorities = &priority;
     const char* deviceExtensions[] = {VK_KHR_SWAPCHAIN_EXTENSION_NAME};
     VkDeviceCreateInfo deviceInfo{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
+    deviceInfo.pNext = &enable;
     deviceInfo.queueCreateInfoCount = 1;
     deviceInfo.pQueueCreateInfos = &queueInfo;
     deviceInfo.enabledExtensionCount = 1;
     deviceInfo.ppEnabledExtensionNames = deviceExtensions;
     if (!Check(vkCreateDevice(gGpu, &deviceInfo, nullptr, &gDevice), "vkCreateDevice", error)) return false;
     vkGetDeviceQueue(gDevice, gQueueFamily, 0, &gQueue);
+
+    // A module for every translated shader, so the driver vets them all up front.
+    size_t shaderCount = 0;
+    Shader* shaders = Shaders(shaderCount);
+    for (size_t i = 0; i < shaderCount; ++i) {
+        VkShaderModuleCreateInfo moduleInfo{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+        moduleInfo.codeSize = shaders[i].spirvSize;
+        moduleInfo.pCode = shaders[i].spirv;
+        VkShaderModule module = VK_NULL_HANDLE;
+        if (vkCreateShaderModule(gDevice, &moduleInfo, nullptr, &module) == VK_SUCCESS) {
+            shaders[i].module = module;
+            ++gShaderModules;
+        }
+    }
 
     VkCommandPoolCreateInfo poolInfo{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
     poolInfo.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
@@ -286,7 +328,8 @@ bool Init(std::string& error) {
     }
     if (!CreateSwapchain(error)) return false;
     kernel::AddReportSection(Describe);
-    kernel::Log("  render: Vulkan on %s, %ux%u window\n", gGpuName.c_str(), gExtent.width, gExtent.height);
+    kernel::Log("  render: Vulkan on %s, %ux%u window; %zu of %zu shaders loaded as modules\n", gGpuName.c_str(),
+                gExtent.width, gExtent.height, gShaderModules, shaderCount);
     return true;
 }
 

@@ -17,6 +17,7 @@
 #include "loader.h"
 #include "memory.h"
 #include "render/presenter.h"
+#include "render/shader_cache.h"
 
 #include <windows.h>
 
@@ -126,6 +127,13 @@ int main(int argc, char** argv) {
     kernel::SetDefaultStackSize(game.xex.defaultStackSize);
     kernel::Log("  TLS: %u static bytes, %u slots; default stack %u KB\n", tls.staticSize, tls.slotCount,
                 game.xex.defaultStackSize / 1024);
+
+    // The translated shaders (scripts/shaders.ps1). Without them the game still runs, but
+    // the renderer can't tell what it draws.
+    if (size_t shaders = render::LoadShaderCache(DefaultWorkPath("shaders\\shader_cache.bin"), error))
+        kernel::Log("  shaders: %zu translated shaders loaded\n", shaders);
+    else
+        kernel::Log("  shaders: %s\n", error.c_str());
 
     // The window belongs to this (the process's main) thread, so it's opened before the
     // title starts and its loop runs here.

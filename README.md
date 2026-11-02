@@ -18,9 +18,10 @@ with real waits, events, mutexes, critical sections and timers. It reads its
 data from your ISO, drives an emulated GPU front end, and has an audio clock
 and a silent XMA decoder. Its whole boot sequence now runs: the EA intro,
 loading, then the title screen, where with no input it starts the
-attract-mode video. Every frame is presented in a Vulkan window, and 391 of
-the game's 392 shaders already translate to SPIR-V, but nothing is drawn yet
-(the window stays black), and there's no sound or input. See
+attract-mode video. Every frame is presented in a Vulkan window. 391 of the
+game's 392 shaders translate to SPIR-V, and the runtime recognises them as the
+GPU loads them. Nothing is drawn yet (the window stays black), and there's
+no sound or input. See
 [docs/PHASE3.md](docs/PHASE3.md) for the details and what's next, and
 [docs/PHASE2.md](docs/PHASE2.md) for the recompilation work.
 

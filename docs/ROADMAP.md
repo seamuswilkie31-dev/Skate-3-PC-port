@@ -86,7 +86,8 @@ first kernel calls.
 **Phase 3 — Kernel until graphics.** *(In progress: threads,
 synchronization, files, the GPU front end, audio clock and a silent XMA
 decoder done; boot reaches the title screen. Rendering has started: a Vulkan
-window and 391 of 392 shaders translated. See [PHASE3.md](PHASE3.md).)*
+window, the Direct3D map, and 391 of 392 shaders translated and recognised as
+the GPU loads them. See [PHASE3.md](PHASE3.md).)*
 Implement kernel/XAM imports in the
 order the game hits them: memory, threads, sync, files (served from the
 ISO), timers, XAM content/profile APIs. Identify the D3D library functions

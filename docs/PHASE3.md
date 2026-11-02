@@ -377,13 +377,72 @@ The findings change the recommendation: drive Vulkan from the command
 processor (packet level), which sees every draw whichever way it was issued,
 rather than replacing Direct3D's draw functions. D3D.md gives both options.
 
+## Rendering, step 3 (first part): shaders at runtime
+
+**The cache.** `recomp/xenosrecomp-patches/0002` makes XenosRecomp also
+write `shader_cache.bin`: each translated shader's container, untouched,
+with its SPIR-V. `shaders.ps1` puts it in `<work>\shaders`.
+- The runtime loads it at start-up (`runtime/render/shader_cache.cpp`).
+- The window makes a Vulkan shader module from each one: all 391.
+- The device is now created with what XenosRecomp's shaders need: buffer
+  device addresses, descriptor indexing and 64-bit integers.
+
+**Which shader is loaded.** The command processor reads the microcode of
+every `IM_LOAD` and `IM_LOAD_IMMEDIATE`. A plain hash of it found only 37%
+of loads, and no draw had both its shaders found. Comparing loaded microcode
+with the containers showed two reasons:
+- **Direct3D binds vertex shaders.** When it binds a vertex shader to a vertex
+  declaration, it fills in the vertex fetch instructions: fetch constant,
+  prefetch count, format, stride and offset. The container leaves those
+  fields zero, and the container's vertex elements say which instructions
+  get filled.
+- **Some shaders carry a trailer.** It's 3 dwords after the last instruction
+  (`4E4A0000` and 8 bytes of hash), and the GPU sometimes gets it cleared.
+
+`ShaderKey` deals with both. It walks the shader's control flow, hashes only
+the instructions the shader runs, and clears the fields Direct3D binds:
+- **391 containers give 249 keys.** Containers that share a key compile to
+  identical SPIR-V, so the key is safe.
+- **The bound fields aren't wasted.** XenosRecomp reads vertex inputs by
+  usage and leaves their formats to the pipeline. So the format, stride and
+  offset of each input come from the bound instructions when pipelines are
+  built.
+
+**Result** (60-second boot):
+
+| | Before (plain hash) | After (`ShaderKey`) |
+|---|---|---|
+| Shader loads found | 148,637 of 403,473 | 321,165 of 403,750 (80%) |
+| Draws with both shaders found | 0 | 147,407 (18 vertex/pixel pairs) |
+
+Every pixel shader is found. Every other draw uses one of four vertex shaders
+that aren't in `shaders_final.big`. The call counters tie each one to the
+function that draws with it:
+
+| Key | Size | Draws | Primitives | Drawn by |
+|---|---|---|---|---|
+| `B0114762…` | 24 dwords | 154,080 | point lists | recorded command buffers: one load per replay (`82B56F08`, 6,420), about 24 draws each; no vertex fetch |
+| `B097E2D0…` | 15 dwords | 47,234 | rectangle lists | `82B55668` (one draw per call); fetches float2 positions only |
+| `053B88DD…` | 27 dwords | 32,770 | rectangle lists | `82B53D40` (one draw per call); fetches a float3 and a float4 |
+| `E8EDE87E…` | 33 dwords | 1,290 | quad lists | the main draw `82B51800`, from game code at `827EE6A8` |
+
+The first three are Direct3D's own shaders. They're bare microcode with no
+container, so XenosRecomp has nothing to translate. The rectangle lists look
+like clears and copies. The run report now lists shader loads found, draws
+by whether their shaders are known, and the unknown shaders with their draw
+counts and primitive types.
+
 ## Next
 
-1. **Rendering, step 3: first pixels.** With the approach settled, start the
-   Vulkan backend behind the command processor:
-   - map each loaded shader's microcode to its translated SPIR-V;
-   - model render targets and resolves;
-   - draw the EA intro and the title screen.
+1. **Rendering, step 3 (continued): first pixels.**
+   - **Direct3D's own shaders:** handle its rectangle lists natively (clears
+     and copies), and find out what the point lists in recorded command
+     buffers do.
+   - **Pipelines:** vertex input from the bound fetch instructions, render
+     state from the registers, constants and textures from the fetch and ALU
+     constants.
+   - **Render targets:** model render targets (EDRAM) and resolves.
+   - **Goal:** draw the EA intro and the title screen.
 2. **Input** (phase 4): pads through SDL3 (`XamInputGetState`), and keyboard
    and mouse mapped onto the same virtual pad (see the roadmap). That's what
    gets past "press Start".
