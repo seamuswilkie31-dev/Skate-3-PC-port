@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstring>
 #include <map>
 #include <unordered_map>
@@ -60,9 +61,22 @@ FormatInfo Format(uint32_t format) {
 // A texture from guest memory, as its fetch constant describes it.
 struct Texture {
     Image image;
-    uint64_t hash = 0;          // of its memory when last converted
+    uint64_t hash = 0;     // of all its memory when last converted
+    uint64_t sampled = 0;  // and of a sample of it
     uint64_t checkedFrame = ~0ull;
 };
+
+// A texture's memory is checked once a frame. A large one is sampled (64 bytes of every 4 KB)
+// except every 16th frame, when all of it is hashed: a change usually reaches all of a texture
+// (one streamed in, a movie frame), and a partial one is still seen within 16 frames.
+constexpr size_t kSampledAbove = 64 << 10;
+constexpr uint64_t kFullCheckFrames = 16;
+
+uint64_t SampledHash(const uint8_t* data, size_t size) {
+    uint64_t hash = size;
+    for (size_t at = 0; at < size; at += 4096) hash = hash * 31 ^ HashMemory(data + at, std::min<size_t>(64, size - at));
+    return hash;
+}
 
 // A view of an image with a fetch constant's swizzle, in a slot of the 2D array.
 struct View {
@@ -429,8 +443,11 @@ Slots BindFetch(const uint32_t fetch[6]) {
     uint64_t frame = FrameNumber();
     if (created || texture.checkedFrame != frame) {
         texture.checkedFrame = frame;
-        uint64_t hash = HashMemory(source, span);
-        if (created || hash != texture.hash) {
+        bool sample = !created && span > kSampledAbove && (frame + key) % kFullCheckFrames != 0;
+        uint64_t hash = sample ? texture.hash : HashMemory(source, span);
+        uint64_t sampled = span > kSampledAbove ? SampledHash(source, span) : 0;
+        if (created || hash != texture.hash || sampled != texture.sampled) {
+            if (sample) hash = HashMemory(source, span);
             size_t faceSize = size_t(blocksWide) * blocksHigh * info.bytes;
             Upload upload;
             VkCommandBuffer cb = Allocate(faceSize * faces, upload);
@@ -457,6 +474,7 @@ Slots BindFetch(const uint32_t fetch[6]) {
             FullBarrier(cb);
             ++(created ? gConverted : gReconverted);
             texture.hash = hash;
+            texture.sampled = sampled;
         }
     }
     slots.kind = cube ? 2 : 0;

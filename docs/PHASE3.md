@@ -810,6 +810,41 @@ at the console's 60 Hz, that's 30 fps. A test with the vblank at 120 Hz:
 Port Carverton the command processor's work (about 17 ms a frame) holds it at
 37–40 fps; reaching 60 needs a faster renderer.
 
+## In the world at 60: the vertex pool
+
+Measured over a minute in the world, the two biggest costs:
+- **Vertex copies:** 10.4 s copying cached vertices into the upload ring
+  (about 43 MB a frame), which the GPU then read over PCIe every draw.
+- **Texture checks:** 5.5 s hashing 78 GB of texture memory, about 34 MB a
+  frame.
+
+**The vertex pool.** Converted vertices now stay on the GPU, in one 768 MB
+device-local buffer handed out first-fit:
+- **A miss** converts into the draw's upload space and draws from there. Its
+  copy into the pool is recorded once the rendering scope ends, or before the
+  recording is submitted (a hook in the backend), so it's always in the same
+  recording as the data.
+- **A hit** binds the pool and allocates no upload space.
+- **Freed regions** (stale or evicted entries) are reused only 8 frames
+  later, when no frame in flight can still draw from them.
+- **Draws of 16 vertices or more** are cached (was 64), which cut converted
+  vertices from 78 million to 15 million a run.
+
+**Sampled checks.** Textures over 64 KB are checked with a sample (64 bytes
+of every 4 KB) each frame and in full every 16th frame, staggered: a change
+usually reaches all of a texture (one streamed in, a movie frame), and a
+partial one is still seen within 16 frames. Vertex runs over 64 KB are
+checked the same way.
+
+**Three recordings in flight** instead of two, each with its own upload
+ring. The report now shows submits and GPU waits: 0.4 s and 0.1 s a run, so
+the GPU keeps up.
+
+**Result:** about **56 fps in Port Carverton** at the 60 fps cap, up from
+37–40. Draw work is about 2.8 µs a draw, spread evenly over indices,
+textures, cache lookups, vertices and recording. The rest needs deeper
+changes, such as caching index buffers the same way.
+
 ## Next
 
 1. **Input** (phase 4): done, see [PHASE4.md](PHASE4.md). Start and A now get

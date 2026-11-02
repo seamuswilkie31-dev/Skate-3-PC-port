@@ -29,6 +29,10 @@ Image* FindTarget(uint32_t base, uint32_t pitch, uint32_t msaa, uint32_t format,
 void BeginRendering(VkCommandBuffer cb, Image* color, Image* depth);
 void EndRendering();
 
+// Called with the command buffer each time a rendering scope ends and before each submit:
+// the places transfer commands a draw put off can go.
+void SetOutsideRenderingHook(void (*hook)(VkCommandBuffer cb));
+
 // Space in this recording's upload ring, mapped and with a device address. Allocate first,
 // then record with the command buffer it returns: if the ring is full, the recording is
 // submitted and a new one started.

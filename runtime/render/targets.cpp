@@ -91,8 +91,9 @@ std::vector<Retired> gRetired;
 bool gSetUp = false;
 bool gUnavailable = false;
 VkCommandPool gPool = VK_NULL_HANDLE;
-VkCommandBuffer gCommands[2] = {};
-uint64_t gSubmittedAt[2] = {};  // timeline value of each command buffer's last submission
+constexpr uint32_t kRecordings = 3;  // in flight at once, each with its own upload ring
+VkCommandBuffer gCommands[kRecordings] = {};
+uint64_t gSubmittedAt[kRecordings] = {};  // timeline value of each command buffer's last submission
 uint32_t gCurrent = 0;
 bool gRecording = false;
 uint32_t gOperations = 0;  // in the current recording
@@ -107,11 +108,13 @@ struct UploadRing {
     VkDeviceAddress address = 0;
     VkDeviceSize used = 0;
 };
-UploadRing gUploads[2];
+UploadRing gUploads[kRecordings];
 uint64_t gRecordingNumber = 0;  // recordings started
+uint64_t gGpuWaitNanoseconds = 0, gSubmitNanoseconds = 0, gSubmits = 0;  // for the report
 
 // The open rendering scope, if any.
 bool gRenderingOpen = false;
+void (*gOutsideRendering)(VkCommandBuffer) = nullptr;  // backend.h's hook
 VkCommandBuffer gRenderingCommands = VK_NULL_HANDLE;
 Image* gOpenColor = nullptr;
 Image* gOpenDepth = nullptr;
@@ -140,6 +143,9 @@ std::string Describe() {
                   lock.owns_lock() ? gTargets.size() : size_t(0), lock.owns_lock() ? gTextures.size() : size_t(0),
                   gClears.load(), gResolves.load(), gSkippedResolves.load(), gResolveClears.load(), gFrames.load(),
                   gFramesWithFront.load());
+    out += line;
+    std::snprintf(line, sizeof line, "  %llu submits taking %.1f s; %.1f s waiting for the GPU to finish a recording\n",
+                  gSubmits, gSubmitNanoseconds / 1e9, gGpuWaitNanoseconds / 1e9);
     out += line;
     if (lock.owns_lock()) {
         for (const Target& t : gTargets) {
@@ -205,7 +211,7 @@ bool SetUp() {
     pool.queueFamilyIndex = vk.queueFamily;
     VkCommandBufferAllocateInfo alloc{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
     alloc.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-    alloc.commandBufferCount = 2;
+    alloc.commandBufferCount = kRecordings;
     VkSemaphoreTypeCreateInfo timelineType{VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO};
     timelineType.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
     VkSemaphoreCreateInfo timeline{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
@@ -214,7 +220,8 @@ bool SetUp() {
     alloc.commandPool = gPool;
     ok = ok && Check(vkAllocateCommandBuffers(vk.device, &alloc, gCommands), "vkAllocateCommandBuffers", error) &&
          Check(vkCreateSemaphore(vk.device, &timeline, nullptr, &gTimeline), "vkCreateSemaphore", error) &&
-         CreateUploadRing(gUploads[0], error) && CreateUploadRing(gUploads[1], error);
+         CreateUploadRing(gUploads[0], error) && CreateUploadRing(gUploads[1], error) &&
+         CreateUploadRing(gUploads[2], error);
     if (!ok) {
         kernel::Log("  targets: %s\n", error.c_str());
         return false;
@@ -243,7 +250,9 @@ VkCommandBuffer Commands() {
     if (!SetUp()) return VK_NULL_HANDLE;
     if (gRecording && gOperations >= kMaxOperations) Submit();
     if (!gRecording) {
+        auto waitStart = std::chrono::steady_clock::now();
         if (gSubmittedAt[gCurrent]) WaitFor(gSubmittedAt[gCurrent]);
+        gGpuWaitNanoseconds += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - waitStart).count();
         VkCommandBuffer cb = gCommands[gCurrent];
         vkResetCommandBuffer(cb, 0);
         VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
@@ -302,7 +311,10 @@ void EndRendering() {
     vkCmdEndRendering(gRenderingCommands);
     FullBarrier(gRenderingCommands);
     gRenderingOpen = false;
+    if (gOutsideRendering) gOutsideRendering(gRenderingCommands);
 }
+
+void SetOutsideRenderingHook(void (*hook)(VkCommandBuffer cb)) { gOutsideRendering = hook; }
 
 uint64_t FrameNumber() { return gFrames; }
 
@@ -343,8 +355,14 @@ namespace {
 
 // Submits the recording. Returns the timeline value it signals when done.
 uint64_t Submit() {
+    auto submitStart = std::chrono::steady_clock::now();
+    struct Timed {
+        std::chrono::steady_clock::time_point start;
+        ~Timed() { gSubmitNanoseconds += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count(); ++gSubmits; }
+    } timed{submitStart};
     EndRendering();
     VkCommandBuffer cb = gCommands[gCurrent];
+    if (gOutsideRendering) gOutsideRendering(cb);
     vkEndCommandBuffer(cb);
     uint64_t value = ++gTimelineValue;
     VkTimelineSemaphoreSubmitInfo values{VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO};
@@ -361,7 +379,7 @@ uint64_t Submit() {
         vkQueueSubmit(Vk().queue, 1, &submit, VK_NULL_HANDLE);
     }
     gSubmittedAt[gCurrent] = value;
-    gCurrent ^= 1;
+    gCurrent = (gCurrent + 1) % kRecordings;
     gRecording = false;
 
     // Free the images the GPU has finished with.
