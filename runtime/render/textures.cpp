@@ -378,12 +378,15 @@ Slots BindFetch(const uint32_t fetch[6]) {
     Slots slots;
     if ((fetch[0] & 3) != 2) return slots;  // not a texture    slots.sampler = SamplerSlot(fetch);
     uint32_t dimension = fetch[5] >> 9 & 3;  // 1D, 2D (or stacked), 3D, cube
-    if (dimension != 1 || (fetch[1] >> 10 & 1)) {
+    if (dimension > 1 || (fetch[1] >> 10 & 1)) {
         slots.kind = dimension == 2 ? 1 : dimension == 3 ? 2 : 0;  // white until those are converted
         return slots;
     }
     uint32_t base = fetch[1] & 0x1FFFF000, format = fetch[1] & 0x3F, endian = fetch[1] >> 6 & 3;
-    uint32_t width = (fetch[2] & 0x1FFF) + 1, height = (fetch[2] >> 13 & 0x1FFF) + 1;
+    // A 1D texture's size is all width. It's made a one-row 2D texture, which is how the
+    // translated shaders sample it.
+    uint32_t width = dimension ? (fetch[2] & 0x1FFF) + 1 : (fetch[2] & 0xFFFFFF) + 1;
+    uint32_t height = dimension ? (fetch[2] >> 13 & 0x1FFF) + 1 : 1;
     uint32_t pitch = (fetch[0] >> 22 & 0x1FF) * 32;
     bool tiled = fetch[0] >> 31;
     uint32_t swizzle = fetch[3] >> 1 & 0xFFF;

@@ -40,6 +40,17 @@ size_t LoadShaderCache(const std::filesystem::path& path, std::string& error);
 // The translated vertex or pixel shader with this key, or nullptr.
 Shader* FindShader(uint64_t key, bool pixel);
 
+// Shaders the game builds from its world archives aren't in shaders_final.big. This saves the
+// containers in memory (the guest's physical memory) whose code the cache lacks, into
+// <cache folder>\source\harvested, for scripts\shaders.ps1 to translate next time. Returns how
+// many it saved.
+size_t HarvestShaders(const uint8_t* memory, size_t size);
+
+// Some pixel shaders have no container at all: the game hands Direct3D bare microcode. This
+// saves one wrapped in a minimal container, its inputs taken from the vertex shader it's
+// drawn with, for the next shader build. False if it was saved before or can't be.
+bool HarvestBarePixelShader(const uint8_t* microcode, size_t size, const Shader& vertexShader);
+
 // Every loaded shader, for the renderer to make modules from.
 Shader* Shaders(size_t& count);
 

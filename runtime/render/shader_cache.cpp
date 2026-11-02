@@ -4,8 +4,10 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdio>
 #include <cstring>
 #include <fstream>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
@@ -35,6 +37,7 @@ constexpr uint32_t kBoundFetchFields[3] = {0x3FF00000, 0x7FFFFFFF, 0x7FFFFFFF};
 
 std::vector<uint8_t> gData;
 std::vector<Shader> gShaders;
+std::filesystem::path gHarvestFolder;  // <cache folder>\source\harvested
 std::unordered_map<uint64_t, Shader*> gByKey[2];  // vertex, pixel
 
 }  // namespace
@@ -116,6 +119,7 @@ size_t LoadShaderCache(const std::filesystem::path& path, std::string& error) {
         return 0;
     }
     gData.assign(std::istreambuf_iterator<char>(file), {});
+    gHarvestFolder = path.parent_path() / "source" / "harvested";
     uint32_t header[4];
     if (gData.size() < sizeof(header)) {
         error = "the shader cache is truncated";
@@ -180,6 +184,121 @@ size_t LoadShaderCache(const std::filesystem::path& path, std::string& error) {
 Shader* FindShader(uint64_t key, bool pixel) {
     auto it = gByKey[pixel].find(key);
     return it == gByKey[pixel].end() ? nullptr : it->second;
+}
+
+size_t HarvestShaders(const uint8_t* memory, size_t size) {
+    constexpr uint32_t kLargest = 256 << 10;  // no game shader container comes close
+    size_t saved = 0;
+    std::error_code ignored;
+    for (size_t at = 0; at + 0x24 <= size; at += 4) {
+        const uint8_t* c = memory + at;
+        if (c[0] != 0x10 || c[1] != 0x2A || c[2] != 0x11) continue;  // container flags: 102A11xx
+        uint32_t virtualSize = LoadBE32(c, 0x04), physicalSize = LoadBE32(c, 0x08), shaderOffset = LoadBE32(c, 0x18);
+        uint64_t total = uint64_t(virtualSize) + physicalSize;
+        if (LoadBE32(c, 0x1C) || LoadBE32(c, 0x20) || total > kLargest || at + total > size ||
+            uint64_t(shaderOffset) + 8 > virtualSize)
+            continue;
+        uint32_t physicalOffset = LoadBE32(c, shaderOffset), codeSize = LoadBE32(c, shaderOffset + 4);
+        if (!codeSize || codeSize % 12 || uint64_t(physicalOffset) + codeSize > physicalSize) continue;
+        bool pixel = !(c[3] & 1);  // flags bit 0: a vertex shader
+        uint64_t key = ShaderKey(c + virtualSize + physicalOffset, codeSize);
+        if (FindShader(key, pixel)) continue;
+        char name[40];
+        std::snprintf(name, sizeof name, "%s_%016llX.bin", pixel ? "ps" : "vs", static_cast<unsigned long long>(key));
+        std::filesystem::path path = gHarvestFolder / name;
+        if (std::filesystem::exists(path, ignored)) continue;
+        std::filesystem::create_directories(gHarvestFolder, ignored);
+        std::ofstream out(path, std::ios::binary);
+        out.write(reinterpret_cast<const char*>(c), std::streamsize(total));
+        if (out) ++saved;
+    }
+    return saved;
+}
+
+namespace {
+
+void PutBE16(std::vector<uint8_t>& out, uint16_t value) {
+    out.push_back(uint8_t(value >> 8));
+    out.push_back(uint8_t(value));
+}
+
+void PutBE32(std::vector<uint8_t>& out, uint32_t value) {
+    for (int shift = 24; shift >= 0; shift -= 8) out.push_back(uint8_t(value >> shift));
+}
+
+// A minimal container around bare pixel shader microcode, as XenosRecomp reads one: a constant
+// table naming c0-c223 (g_C), c224-c255 one register each (XenosRecomp's arrays stop at c223
+// for pixel shaders) and samplers s0-s15; no literals, so every constant comes from the
+// registers; colour 0 out; and these interpolators (usage index, usage, register).
+std::vector<uint8_t> BareContainer(const uint8_t* microcode, size_t size, const std::vector<uint32_t>& interpolators) {
+    struct Entry {
+        std::string name;
+        uint16_t set, index, count;
+        uint32_t type;
+    };
+    std::vector<Entry> entries{{"g_C", 2, 0, 224, 0}};
+    for (uint16_t i = 0; i < 16; ++i) entries.push_back({"s" + std::to_string(i), 3, i, 1, 1});
+    for (uint16_t i = 224; i < 256; ++i) entries.push_back({"g_C" + std::to_string(i), 2, i, 1, 2});
+
+    // The constant table: its header, the constants, three types, then the names.
+    std::vector<uint8_t> table;
+    uint32_t infoAt = 7 * 4, typeAt = infoAt + uint32_t(entries.size()) * 20, nameAt = typeAt + 3 * 16;
+    for (uint32_t value : {0u, 0u, 0u, uint32_t(entries.size()), infoAt, 0u, 0u}) PutBE32(table, value);
+    std::string names;
+    for (const Entry& e : entries) {
+        PutBE32(table, nameAt + uint32_t(names.size()));
+        PutBE16(table, e.set), PutBE16(table, e.index), PutBE16(table, e.count), PutBE16(table, 0);
+        PutBE32(table, typeAt + e.type * 16), PutBE32(table, 0);
+        names += e.name + '\0';
+    }
+    static constexpr uint16_t kTypes[3][6] = {{1, 3, 1, 4, 224, 0}, {4, 12, 1, 1, 1, 0}, {1, 3, 1, 4, 1, 0}};
+    for (const auto& type : kTypes) {
+        for (uint16_t value : type) PutBE16(table, value);
+        PutBE32(table, 0);
+    }
+    table.insert(table.end(), names.begin(), names.end());
+    while (table.size() % 4) table.push_back(0);
+
+    std::vector<uint8_t> container;
+    uint32_t tableAt = 0x24, shaderAt = tableAt + 4 + uint32_t(table.size());
+    uint32_t virtualSize = shaderAt + 8 * 4 + uint32_t(interpolators.size()) * 4;
+    for (uint32_t value : {0x102A1100u, virtualSize, uint32_t(size), 0u, tableAt, 0u, shaderAt, 0u, 0u})
+        PutBE32(container, value);
+    PutBE32(container, uint32_t(table.size()));
+    container.insert(container.end(), table.begin(), table.end());
+    // The shader: microcode at 0 in the physical part, no position input, its interpolators,
+    // and colour 0.
+    for (uint32_t value : {0u, uint32_t(size), 0u, 0xFF00u, 0u, uint32_t(interpolators.size()) << 5, 0u, 1u})
+        PutBE32(container, value);
+    for (uint32_t value : interpolators) PutBE32(container, value);
+    container.insert(container.end(), microcode, microcode + size);
+    return container;
+}
+
+}  // namespace
+
+bool HarvestBarePixelShader(const uint8_t* microcode, size_t size, const Shader& vertexShader) {
+    // The vertex shader's interpolators, in export order: the GPU hands export i to the pixel
+    // shader's register i.
+    const uint8_t* c = vertexShader.container;
+    uint32_t shaderOffset = LoadBE32(c, 0x18);
+    uint32_t count = LoadBE32(c, shaderOffset + 0x14) >> 5 & 0x1F;
+    uint32_t skip = LoadBE32(c, shaderOffset + 0x18) + LoadBE32(c, shaderOffset + 0x1C);
+    if (uint64_t(shaderOffset) + 0x24 + uint64_t(skip + count) * 4 > vertexShader.containerSize) return false;
+    std::vector<uint32_t> interpolators;
+    for (uint32_t i = 0; i < count; ++i)
+        interpolators.push_back((LoadBE32(c, shaderOffset + 0x24 + (skip + i) * 4) & 0xFF) | i << 8);
+
+    char name[40];
+    std::snprintf(name, sizeof name, "ps_%016llX.bin", static_cast<unsigned long long>(ShaderKey(microcode, size)));
+    std::error_code ignored;
+    std::filesystem::path path = gHarvestFolder / name;
+    if (std::filesystem::exists(path, ignored)) return false;
+    std::filesystem::create_directories(gHarvestFolder, ignored);
+    std::vector<uint8_t> container = BareContainer(microcode, size, interpolators);
+    std::ofstream out(path, std::ios::binary);
+    out.write(reinterpret_cast<const char*>(container.data()), std::streamsize(container.size()));
+    return bool(out);
 }
 
 Shader* Shaders(size_t& count) {

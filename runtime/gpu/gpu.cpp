@@ -20,6 +20,7 @@
 #include <mutex>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace s3n::gpu {
@@ -138,6 +139,9 @@ std::array<std::atomic<uint64_t>, 64> gPrimitives{};  // draws by primitive type
 std::mutex gStatsMutex;
 std::unordered_map<uint64_t, uint64_t> gShaderPairs;  // vertex * 31 + pixel container hash -> draws
 std::unordered_map<uint64_t, UnknownShader> gUnknownShaders;  // by key (pixel shaders' keys inverted)
+size_t gHarvested = 0;  // shader containers saved for the next shader build
+std::unordered_set<uint64_t> gBareTried;  // pixel shaders without containers, wrapped once
+constexpr size_t kPhysicalSize = 0x20000000;
 
 void LoadShader(uint32_t type, const uint8_t* microcode, uint32_t dwords) {
     ++gShaderLoads;
@@ -146,7 +150,7 @@ void LoadShader(uint32_t type, const uint8_t* microcode, uint32_t dwords) {
     bound.loaded = true;
     bound.key = render::ShaderKey(microcode, size_t(dwords) * 4);
     bound.shader = render::FindShader(bound.key, pixel);
-    if (!pixel) bound.microcode.assign(microcode, microcode + size_t(dwords) * 4);
+    if (!pixel || !bound.shader) bound.microcode.assign(microcode, microcode + size_t(dwords) * 4);
     if (bound.shader) {
         ++gShaderHits;
         return;
@@ -157,6 +161,11 @@ void LoadShader(uint32_t type, const uint8_t* microcode, uint32_t dwords) {
     if (inserted && gUnknownShaders.size() <= 8)
         kernel::Log("  gpu: %s shader %016llX (%u dwords) isn't in the shader cache\n", pixel ? "pixel" : "vertex",
                     bound.key, dwords);
+    if (inserted) {  // the game may have built it from a world archive: look for its container
+        size_t saved = render::HarvestShaders(gMemory->Physical(0), kPhysicalSize);
+        gHarvested += saved;
+        if (saved) kernel::Log("  gpu: saved %zu shader containers the cache lacks (scripts\\shaders.ps1 translates them)\n", saved);
+    }
 }
 
 uint32_t ReadRegister(uint32_t index);
@@ -208,6 +217,13 @@ void RecordDraw(uint32_t initiator, uint32_t indexBase, uint32_t indexSize) {
         if (!u) continue;
         ++u->draws;
         u->primitives |= 1ull << (initiator & 0x3F);
+    }
+    // A pixel shader with no container: wrapped for the next shader build, with the inputs of
+    // the first vertex shader it's drawn with.
+    if (!pixel.shader && vertex.shader && gBareTried.insert(pixel.key).second &&
+        render::HarvestBarePixelShader(pixel.microcode.data(), pixel.microcode.size(), *vertex.shader)) {
+        ++gHarvested;
+        kernel::Log("  gpu: saved pixel shader %016llX, which has no container, for the next shader build\n", pixel.key);
     }
 }
 
@@ -693,8 +709,8 @@ std::string Describe() {
     }
     // The tables, unless the command processor was stopped holding them.
     std::unique_lock lock(gStatsMutex, std::try_to_lock);
-    std::snprintf(line, sizeof line, "  shaders: %llu loads, %llu found in the cache; %zu unknown shaders\n",
-                  gShaderLoads.load(), gShaderHits.load(), lock.owns_lock() ? gUnknownShaders.size() : size_t(0));
+    std::snprintf(line, sizeof line, "  shaders: %llu loads, %llu found in the cache; %zu unknown shaders; %zu containers saved for the next shader build\n",
+                  gShaderLoads.load(), gShaderHits.load(), lock.owns_lock() ? gUnknownShaders.size() : size_t(0), gHarvested);
     out += line;
     std::snprintf(line, sizeof line,
                   "  draws: %llu resolves, %llu Direct3D clears, %llu with both shaders known (%zu shader pairs), %llu "

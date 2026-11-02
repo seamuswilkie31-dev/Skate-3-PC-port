@@ -1,0 +1,31 @@
+diff --git a/XenosRecomp/shader_common.h b/XenosRecomp/shader_common.h
+index 1c74034..bbfd6fa 100644
+--- a/XenosRecomp/shader_common.h
++++ b/XenosRecomp/shader_common.h
+@@ -143,6 +143,11 @@ float4 tfetch2DBicubic(uint resourceDescriptorIndex, uint samplerDescriptorIndex
+     return r;
+ }
+ 
++float4 tfetch1D(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float texCoord)
++{
++    return tfetch2D(resourceDescriptorIndex, samplerDescriptorIndex, float2(texCoord, 0.5), float2(0, 0));
++}
++
+ float4 tfetch3D(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float3 texCoord)
+ {
+     return g_Texture3DDescriptorHeap[resourceDescriptorIndex].Sample(g_SamplerDescriptorHeap[samplerDescriptorIndex], texCoord);
+diff --git a/XenosRecomp/shader_recompiler.cpp b/XenosRecomp/shader_recompiler.cpp
+index 698a418..9374aed 100644
+--- a/XenosRecomp/shader_recompiler.cpp
++++ b/XenosRecomp/shader_recompiler.cpp
+@@ -1246,6 +1246,10 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+ 
+     out += "#endif\n";
+ 
++    // 1D textures are sampled as one-row 2D textures, through the 2D descriptors.
++    for (const auto& [registerIndex, samplerName] : samplers)
++        println("#define {0}_Texture1DDescriptorIndex {0}_Texture2DDescriptorIndex", samplerName);
++
+     for (uint32_t i = 0; i < constantTableContainer->constantTable.constants; i++)
+     {
+         const auto constantInfo = reinterpret_cast<const ConstantInfo*>(

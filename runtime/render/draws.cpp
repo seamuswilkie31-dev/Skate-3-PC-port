@@ -1003,9 +1003,10 @@ void Draw(const DrawCall& call) {
         for (uint32_t s = 0; s < 16; ++s) {
             if (!(textureMask >> s & 1)) continue;
             uint32_t base = Register(reg::kFetchConstants + s * 6 + 1), size = Register(reg::kFetchConstants + s * 6 + 2);
+            uint32_t dimension = Register(reg::kFetchConstants + s * 6 + 5) >> 9 & 3;  // 1D, 2D, 3D, cube
             char item[96];
-            std::snprintf(item, sizeof item, " t%u=%08X/fmt%u/%ux%u/slot%u", s, base & 0x1FFFF000, base & 0x3F,
-                          (size & 0x1FFF) + 1, (size >> 13 & 0x1FFF) + 1, slots[s].texture);
+            std::snprintf(item, sizeof item, " t%u=%08X/fmt%u/%ux%u/%uD/slot%u", s, base & 0x1FFFF000, base & 0x3F,
+                          (size & 0x1FFF) + 1, (size >> 13 & 0x1FFF) + 1, dimension + 1, slots[s].texture);
             textureList += item;
         }
         std::string inputList;  // location: format (n normalised, i integer; s signed), offset/stride in dwords

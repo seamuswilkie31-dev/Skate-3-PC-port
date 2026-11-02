@@ -684,13 +684,48 @@ come from lifting that cap (the 60/120/240 fps option), not from here.
 
 **Still slow to load:** the time between screens is the game's own loading.
 
+## The sky: shaders from outside the shader archive
+
+The sky was black. Its pixel shader (`4C2C4E6F…`, 84 dwords, drawn about 4
+times a frame) wasn't in `shaders_final.big`, or in any container in memory:
+the game hands Direct3D bare microcode. It sits in the game's heap behind an
+8-byte hash and a few floats, with no constant table or interpolators.
+Translated, it samples a 2D sky texture, lights it against a sun direction,
+looks up a 1D ramp, and writes gamma-corrected colour.
+
+**Shader harvesting** (`render/shader_cache.cpp`):
+- **Containers in memory.** When a shader key is first found missing, the
+  runtime scans the guest's physical memory for shader containers whose code
+  the cache lacks. It saves them to `<work>\shaders\source\harvested`.
+  XenosRecomp reads that folder with the rest the next time
+  `scripts\shaders.ps1` runs.
+- **Bare pixel shaders.** When a draw uses a pixel shader the cache lacks with
+  a vertex shader it has, the runtime wraps the microcode in a minimal
+  container and saves it there too:
+  - its inputs are the vertex shader's interpolators, in export order (the
+    GPU hands export *i* to pixel register *i*);
+  - a constant table names c0–c223 as one array, c224–c255 one register each
+    (XenosRecomp's pixel shader arrays stop at c223) and samplers s0–s15, so
+    every constant, literals included, comes from the registers.
+- **1D textures** (XenosRecomp patch `0003-1d-textures.patch`): a 1D fetch
+  samples a one-row 2D texture through the 2D descriptors. The runtime now
+  converts 1D textures as one-row 2D ones instead of binding white.
+  `scripts\setup_tools.ps1` applies the patch.
+
+**Result:** with the harvested shader in the cache (393 shaders), the sky
+renders: blue, with the sun's glow, clouds and the city on the horizon. The
+frame capture now also logs each texture's dimension.
+
+**Still white:** cube maps (the environment maps reflective surfaces add,
+258 bindings a frame) and depth textures (shadow maps, 278 a frame).
+
 ## Next
 
 1. **Input** (phase 4): done, see [PHASE4.md](PHASE4.md). Start and A now get
    the game past the title screen and its autosave notice, to the storage
    device prompt.
-2. **Rendering, continued:** speed, depth resolves (shadows), the black sky,
-   and one unknown pixel shader seen in the world.
+2. **Rendering, continued:** cube maps, depth resolves (shadows), and the
+   60/120/240 fps option.
 3. **Audio output** (phase 4): real XMA decoding behind the same context
    interface, and the render driver's frames played through SDL3.
 4. **Saves and DLC** (phase 5): the hard drive and cache partitions, the
