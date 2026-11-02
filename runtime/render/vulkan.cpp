@@ -58,7 +58,8 @@ bool CreateImage(Image& image, VkFormat format, uint32_t width, uint32_t height,
         !Check(vkBindImageMemory(vk.device, image.image, image.memory, 0), "vkBindImageMemory", error))
         return false;
 
-    if (usage & (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT)) {
+    if (usage & (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT |
+                 VK_IMAGE_USAGE_STORAGE_BIT)) {
         VkImageViewCreateInfo view{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
         view.image = image.image;
         view.viewType = VK_IMAGE_VIEW_TYPE_2D;

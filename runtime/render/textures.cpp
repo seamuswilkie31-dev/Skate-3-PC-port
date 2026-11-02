@@ -21,6 +21,7 @@ namespace reg = gpu::reg;
 using namespace backend;
 
 constexpr uint32_t kSlots[4] = {4096, 256, 256, 256};  // 2D, 3D and cube textures; samplers
+constexpr uint32_t kDepthFormat = 22;                     // k_24_8: a depth resolve read as depth
 
 // A texture format as Vulkan stores it: its block size (4 for the compressed formats),
 // bytes per block, and which Vulkan component holds each of the GPU's x, y, z and w.
@@ -396,7 +397,7 @@ Slots BindFetch(const uint32_t fetch[6]) {
 
     // A render target a resolve copied out here: sampled directly.
     uint64_t serial = 0;
-    if (Image* resolved = ResolvedImage(base, serial)) {
+    if (Image* resolved = ResolvedImage(base, serial, format == kDepthFormat)) {
         static constexpr uint8_t kIdentity[4] = {0, 1, 2, 3};
         slots.texture = ViewSlot(*resolved, serial, swizzle, kIdentity);
         ++gResolvedUses;

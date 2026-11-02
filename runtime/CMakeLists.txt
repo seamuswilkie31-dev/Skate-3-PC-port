@@ -34,9 +34,27 @@ find_package(Vulkan REQUIRED)
 file(GLOB S3N_DEVICE_SOURCES CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/gpu/*.cpp" "${CMAKE_CURRENT_SOURCE_DIR}/apu/*.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/render/*.cpp" "${CMAKE_CURRENT_SOURCE_DIR}/hooks/*.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/input/*.cpp")
+# The runtime's own GPU passes (render/shaders), compiled to SPIR-V for #include as arrays.
+set(S3N_SHADER_OUT "${CMAKE_CURRENT_BINARY_DIR}/shaders")
+set(S3N_SPIRV)
+foreach(variant "depth_resolve" "depth_resolve_msaa")
+    set(out "${S3N_SHADER_OUT}/${variant}.spv.inc")
+    set(defines)
+    if(variant MATCHES "_msaa$")
+        set(defines -DMSAA)
+    endif()
+    add_custom_command(OUTPUT "${out}"
+        COMMAND "${CMAKE_COMMAND}" -E make_directory "${S3N_SHADER_OUT}"
+        COMMAND "${Vulkan_GLSLC_EXECUTABLE}" ${defines} -O -mfmt=num -o "${out}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/render/shaders/depth_resolve.comp"
+        DEPENDS render/shaders/depth_resolve.comp
+        COMMENT "Compiling ${variant}")
+    list(APPEND S3N_SPIRV "${out}")
+endforeach()
+
 add_executable(s3native main.cpp memory.cpp loader.cpp disc.cpp ${S3N_KERNEL_SOURCES} ${S3N_DEVICE_SOURCES}
-    "${S3N_IMPORT_STUBS}")
-target_include_directories(s3native PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+    "${S3N_IMPORT_STUBS}" ${S3N_SPIRV})
+target_include_directories(s3native PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}" "${S3N_SHADER_OUT}")
 target_compile_definitions(s3native PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
 target_link_libraries(s3native PRIVATE s3n_guest s3n_common SDL3::SDL3-static Vulkan::Vulkan)
 target_compile_options(s3native PRIVATE ${S3N_RECOMP_FLAGS})

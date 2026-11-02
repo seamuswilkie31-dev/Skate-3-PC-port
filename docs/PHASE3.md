@@ -755,6 +755,35 @@ changed. Shadows still don't show. The shadow maps are turned into a 16_16
 texture by the game's own passes before the world samples it, and that chain
 is the next thing to follow.
 
+## Shadows: the depth resolve pass
+
+**The shadow chain.** For each of three cascades the game:
+1. renders depth into a 512×512 slice of a 1536-wide surface;
+2. resolves it (`00164000`);
+3. turns it into two moments in a 16_16 target with a horizontal blur;
+4. blurs those vertically into `00564000`, which the world samples.
+
+The first blur reads the depth resolve **as 8888**. It rebuilds 24-bit depth
+from three of the bytes (its literals are 255·2¹⁶, 255·2⁸ and 255 over
+2²⁴−1) and uses the fourth, the stencil, as a flag. The float texture gave it
+depth, 0, 0, 1, so the moments, and the shadows, came out wrong.
+
+**The depth resolve pass** (`render/shaders/depth_resolve.comp`) is the
+runtime's own compute shader:
+- **Built in:** compiled to SPIR-V by the Vulkan SDK's `glslc` and embedded,
+  once as is and once for MSAA depth buffers (sample 0).
+- **Two outputs per resolve:** for each texel it writes the raw word the GPU
+  would (24-bit normalised depth above 8-bit stencil) as RGBA8 bytes, and the
+  depth as a float into a twin R32F image.
+- **The fetch picks:** a fetch as `k_24_8` gets the float twin; any other
+  format gets the bytes, through the fetch constant's swizzle as usual.
+- **Every depth resolve,** single-sample or MSAA, now goes through it. Depth
+  buffers are D24S8 again (the pass reads either format as a float).
+
+**Result:** the skater and the pedestrians cast shadows, and no resolve is
+skipped. With the Khronos validation layer on, the only report is a warning
+that some depth-only passes' pixel shaders write colour.
+
 ## Next
 
 1. **Input** (phase 4): done, see [PHASE4.md](PHASE4.md). Start and A now get

@@ -65,8 +65,9 @@ inline uint64_t HashMemory(const uint8_t* data, size_t size) {
 }
 
 // The texture a resolve last wrote at this physical address, or nullptr. serial changes
-// whenever the image is made again.
-Image* ResolvedImage(uint32_t address, uint64_t& serial);
+// whenever the image is made again. For a depth resolve, `depth` asks for the depth as floats
+// (a k_24_8 read) instead of the raw words' bytes.
+Image* ResolvedImage(uint32_t address, uint64_t& serial, bool depth = false);
 
 // Changes whenever a resolve texture's image is made (again).
 uint64_t ResolveSerial();

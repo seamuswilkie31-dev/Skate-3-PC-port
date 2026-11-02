@@ -1,0 +1,36 @@
+#version 450
+// A depth resolve, as the GPU does it: each texel of the depth buffer becomes one 32-bit word,
+// 24-bit unsigned normalised depth above 8-bit stencil, written to memory raw. Games read that
+// back either as k_24_8 (depth in x) or as 8888 (the word's bytes, low byte first). This writes
+// both: the word's bytes to an RGBA8 image, and the depth as a float to an R32F image.
+// Compiled twice: as is, and with MSAA defined for multisampled depth buffers (sample 0).
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+#ifdef MSAA
+layout(binding = 0) uniform sampler2DMS depthBuffer;
+layout(binding = 1) uniform usampler2DMS stencilBuffer;
+#define FETCH(image, at) texelFetch(image, at, 0)
+#else
+layout(binding = 0) uniform sampler2D depthBuffer;
+layout(binding = 1) uniform usampler2D stencilBuffer;
+#define FETCH(image, at) texelFetch(image, at, 0)
+#endif
+layout(binding = 2, rgba8) uniform writeonly image2D packedOut;
+layout(binding = 3, r32f) uniform writeonly image2D depthOut;
+
+layout(push_constant) uniform Rect {
+    ivec2 source;  // in the depth buffer
+    ivec2 dest;    // in both outputs
+    ivec2 size;
+};
+
+void main() {
+    ivec2 at = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(at, size))) return;
+    float depth = clamp(FETCH(depthBuffer, source + at).r, 0.0, 1.0);
+    uint stencil = FETCH(stencilBuffer, source + at).r & 0xFFu;
+    uint word = uint(depth * 16777215.0 + 0.5) << 8 | stencil;
+    imageStore(packedOut, dest + at, unpackUnorm4x8(word));
+    imageStore(depthOut, dest + at, vec4(depth, 0.0, 0.0, 1.0));
+}

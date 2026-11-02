@@ -16,6 +16,7 @@
 #include <deque>
 #include <filesystem>
 #include <fstream>
+#include <map>
 #include <mutex>
 #include <vector>
 
@@ -67,6 +68,7 @@ struct Texture {
     uint32_t address;
     uint32_t format;  // RB_COPY_DEST_INFO's
     Image image;
+    Image depth;          // a depth resolve's depth as floats, for k_24_8 reads
     uint64_t serial = 0;  // new for each image made
 };
 uint64_t gTextureSerial = 0;
@@ -310,11 +312,11 @@ uint64_t ResolveSerial() { return gTextureSerial; }
 
 bool Capturing() { return gCaptureFrame && gFrames + 1 == gCaptureFrame; }
 
-Image* ResolvedImage(uint32_t address, uint64_t& serial) {
+Image* ResolvedImage(uint32_t address, uint64_t& serial, bool depth) {
     for (Texture& t : gTextures) {
         if (t.address == address && t.image.image) {
             serial = t.serial;
-            return &t.image;
+            return depth && t.depth.image ? &t.depth : &t.image;
         }
     }
     return nullptr;
@@ -402,7 +404,8 @@ Image* FindTarget(uint32_t base, uint32_t pitch, uint32_t msaa, uint32_t format,
                                     : msaa == 1 ? VK_SAMPLE_COUNT_2_BIT
                                                 : VK_SAMPLE_COUNT_1_BIT;
     Target target{base, pitch, msaa, format, depth};
-    VkImageUsageFlags usage = (depth ? VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT : VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) |
+    VkImageUsageFlags usage = (depth ? VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT  // depth resolves
+                                     : VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) |
                               VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
     std::string error;
     if (!CreateImage(target.image, depth ? Vk().depthFormat : ColorFormat(format), pitch, height, samples, usage, cb,
@@ -443,8 +446,8 @@ uint32_t DestinationBytes(uint32_t format) {
 // The texture a resolve writes at `address`, made (again) to fit, and the row `address` is
 // at. A screen drawn in tiles is resolved a tile at a time, and Direct3D points each tile's
 // resolve at the tile's first row, inside the texture the first tile made.
-Image* DestinationTexture(uint32_t address, uint32_t width, uint32_t height, VkFormat format, uint32_t guestFormat,
-                          VkCommandBuffer cb, int32_t& row) {
+Texture* DestinationTexture(uint32_t address, uint32_t width, uint32_t height, VkFormat format, uint32_t guestFormat,
+                            VkCommandBuffer cb, int32_t& row, bool depthResolve = false) {
     row = 0;
     Texture* texture = nullptr;
     for (Texture& t : gTextures)
@@ -454,18 +457,20 @@ Image* DestinationTexture(uint32_t address, uint32_t width, uint32_t height, VkF
         for (Texture& t : gTextures) {
             if (!t.image.image || t.image.width != width || t.image.format != format || address <= t.address) continue;
             uint32_t offset = address - t.address;
-            if (offset % rowBytes == 0 && offset / rowBytes < t.image.height) {
+            if (offset % rowBytes == 0 && offset / rowBytes < t.image.height && !depthResolve == !t.depth.image) {
                 row = int32_t(offset / rowBytes);
-                return &t.image;
+                return &t;
             }
         }
     }
-    if (texture && texture->image.width == width && texture->image.height == height && texture->image.format == format) {
+    if (texture && texture->image.width == width && texture->image.height == height && texture->image.format == format &&
+        !depthResolve == !texture->depth.image) {
         texture->format = guestFormat;
-        return &texture->image;
+        return texture;
     }
     if (texture) {
         Retire(texture->image);
+        if (texture->depth.image) Retire(texture->depth);
     } else {
         std::lock_guard lock(gMutex);
         gTextures.push_back({address, guestFormat, Image{}});
@@ -474,14 +479,18 @@ Image* DestinationTexture(uint32_t address, uint32_t width, uint32_t height, VkF
     texture->format = guestFormat;
     texture->serial = ++gTextureSerial;
     std::string error;
-    if (!CreateImage(texture->image, format, width, height, VK_SAMPLE_COUNT_1_BIT,
-                     VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, cb,
-                     error)) {
+    // A depth resolve's images are written by the depth resolve pass.
+    VkImageUsageFlags usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
+                              (depthResolve ? VK_IMAGE_USAGE_STORAGE_BIT : 0);
+    if (!CreateImage(texture->image, format, width, height, VK_SAMPLE_COUNT_1_BIT, usage, cb, error) ||
+        (depthResolve && !CreateImage(texture->depth, VK_FORMAT_R32_SFLOAT, width, height, VK_SAMPLE_COUNT_1_BIT, usage, cb,
+                                      error))) {
         kernel::Log("  targets: can't make a %ux%u resolve texture: %s\n", width, height, error.c_str());
         DestroyImage(texture->image);
+        DestroyImage(texture->depth);
         return nullptr;
     }
-    return &texture->image;
+    return texture;
 }
 
 float LoadFloat(const uint8_t* data, uint32_t index) {
@@ -585,42 +594,155 @@ bool ClampCopy(Rect edram, int32_t row, const Image& source, const Image& dest, 
     return w > 0 && h > 0;
 }
 
-// Copies `edram` from a float depth target into the resolve's destination as 32-bit floats,
-// through the upload ring (Vulkan copies depth to colour only by way of a buffer). Direct3D
-// resolves depth as raw 32-bit texels and the texture fetch decides how they're read: shadow
-// maps as k_24_8, depth in x, which is what this gives. (Read as 8888, the GPU would give the
-// packed depth and stencil bytes; here it's depth, 0, 0, 1.)
-void CopyDepthOut(Image& source, Rect edram) {
+// The depth resolve pass (render/shaders/depth_resolve.comp): a depth buffer's rectangle into
+// the raw words' bytes and the depth as floats, in one dispatch.
+const uint32_t kDepthResolveSpirv[] = {
+#include "depth_resolve.spv.inc"
+};
+const uint32_t kDepthResolveMsaaSpirv[] = {
+#include "depth_resolve_msaa.spv.inc"
+};
+
+struct DepthPass {
+    bool tried = false;
+    VkDescriptorSetLayout setLayout = VK_NULL_HANDLE;
+    VkPipelineLayout layout = VK_NULL_HANDLE;
+    VkPipeline pipelines[2] = {};  // single-sample, MSAA
+    VkDescriptorPool pool = VK_NULL_HANDLE;
+    VkSampler sampler = VK_NULL_HANDLE;
+    std::map<VkImage, std::pair<VkImageView, VkImageView>> sourceViews;  // depth targets: depth, stencil
+    std::map<std::pair<VkImage, uint64_t>, VkDescriptorSet> sets;     // (depth target, texture serial)
+};
+DepthPass gDepthPass;
+
+bool SetUpDepthPass() {
+    DepthPass& p = gDepthPass;
+    if (p.tried) return p.pipelines[0] != VK_NULL_HANDLE;
+    p.tried = true;
+    VkDevice device = Vk().device;
+    VkDescriptorSetLayoutBinding bindings[4]{};
+    for (uint32_t i = 0; i < 4; ++i) {
+        bindings[i].binding = i;
+        bindings[i].descriptorType = i < 2 ? VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER : VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+        bindings[i].descriptorCount = 1;
+        bindings[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    }
+    VkDescriptorSetLayoutCreateInfo setInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+    setInfo.bindingCount = 4;
+    setInfo.pBindings = bindings;
+    VkPushConstantRange push{VK_SHADER_STAGE_COMPUTE_BIT, 0, 6 * sizeof(int32_t)};
+    VkPipelineLayoutCreateInfo layoutInfo{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    layoutInfo.setLayoutCount = 1;
+    layoutInfo.pSetLayouts = &p.setLayout;
+    layoutInfo.pushConstantRangeCount = 1;
+    layoutInfo.pPushConstantRanges = &push;
+    VkDescriptorPoolSize sizes[2] = {{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 512}, {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 512}};
+    VkDescriptorPoolCreateInfo poolInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+    poolInfo.maxSets = 256;
+    poolInfo.poolSizeCount = 2;
+    poolInfo.pPoolSizes = sizes;
+    VkSamplerCreateInfo samplerInfo{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};  // texelFetch only: nearest
+    if (vkCreateDescriptorSetLayout(device, &setInfo, nullptr, &p.setLayout) != VK_SUCCESS ||
+        vkCreatePipelineLayout(device, &layoutInfo, nullptr, &p.layout) != VK_SUCCESS ||
+        vkCreateDescriptorPool(device, &poolInfo, nullptr, &p.pool) != VK_SUCCESS ||
+        vkCreateSampler(device, &samplerInfo, nullptr, &p.sampler) != VK_SUCCESS) {
+        kernel::Log("  targets: can't set up the depth resolve pass\n");
+        return false;
+    }
+    const std::pair<const uint32_t*, size_t> code[2] = {{kDepthResolveSpirv, sizeof kDepthResolveSpirv},
+                                                        {kDepthResolveMsaaSpirv, sizeof kDepthResolveMsaaSpirv}};
+    for (int i = 0; i < 2; ++i) {
+        VkShaderModuleCreateInfo moduleInfo{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+        moduleInfo.codeSize = code[i].second;
+        moduleInfo.pCode = code[i].first;
+        VkShaderModule module = VK_NULL_HANDLE;
+        if (vkCreateShaderModule(device, &moduleInfo, nullptr, &module) != VK_SUCCESS) return false;
+        VkComputePipelineCreateInfo info{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+        info.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_COMPUTE_BIT, module, "main"};
+        info.layout = p.layout;
+        VkResult result = vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &info, nullptr, &p.pipelines[i]);
+        vkDestroyShaderModule(device, module, nullptr);
+        if (result != VK_SUCCESS) {
+            kernel::Log("  targets: can't make the depth resolve pipeline (%d)\n", int(result));
+            p.pipelines[0] = VK_NULL_HANDLE;
+            return false;
+        }
+    }
+    return true;
+}
+
+// The descriptor set that reads this depth target and writes this texture's two images.
+VkDescriptorSet DepthPassSet(const Image& source, const Texture& texture) {
+    DepthPass& p = gDepthPass;
+    auto key = std::make_pair(source.image, texture.serial);
+    if (auto it = p.sets.find(key); it != p.sets.end()) return it->second;
+    VkDevice device = Vk().device;
+    auto& views = p.sourceViews[source.image];
+    for (VkImageView* view : {&views.first, &views.second}) {
+        if (*view) continue;
+        VkImageViewCreateInfo info{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+        info.image = source.image;
+        info.viewType = VK_IMAGE_VIEW_TYPE_2D;
+        info.format = source.format;
+        VkImageAspectFlags aspect = view == &views.first ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_STENCIL_BIT;
+        info.subresourceRange = {aspect, 0, 1, 0, 1};
+        if (vkCreateImageView(device, &info, nullptr, view) != VK_SUCCESS) return VK_NULL_HANDLE;
+    }
+    VkDescriptorSetAllocateInfo alloc{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+    alloc.descriptorPool = p.pool;
+    alloc.descriptorSetCount = 1;
+    alloc.pSetLayouts = &p.setLayout;
+    VkDescriptorSet set = VK_NULL_HANDLE;
+    if (vkAllocateDescriptorSets(device, &alloc, &set) != VK_SUCCESS) return VK_NULL_HANDLE;
+    VkDescriptorImageInfo images[4] = {{p.sampler, views.first, VK_IMAGE_LAYOUT_GENERAL},
+                                       {p.sampler, views.second, VK_IMAGE_LAYOUT_GENERAL},
+                                       {VK_NULL_HANDLE, texture.image.view, VK_IMAGE_LAYOUT_GENERAL},
+                                       {VK_NULL_HANDLE, texture.depth.view, VK_IMAGE_LAYOUT_GENERAL}};
+    VkWriteDescriptorSet writes[4]{};
+    for (uint32_t i = 0; i < 4; ++i) {
+        writes[i] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+        writes[i].dstSet = set;
+        writes[i].dstBinding = i;
+        writes[i].descriptorCount = 1;
+        writes[i].descriptorType = i < 2 ? VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER : VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+        writes[i].pImageInfo = &images[i];
+    }
+    vkUpdateDescriptorSets(device, 4, writes, 0, nullptr);
+    p.sets.emplace(key, set);
+    return set;
+}
+
+// A depth resolve. Direct3D resolves depth as raw 32-bit words, 24-bit depth above 8-bit
+// stencil, and the texture fetch decides how they're read: shadow maps as k_24_8 (depth in x),
+// the scene's depth as 8888 (the bytes, decoded by the game's shaders). The pass writes both,
+// the bytes as RGBA8 and the depth as floats; MSAA buffers give sample 0.
+void DepthOut(Image& source, Rect edram) {
     EndRendering();
+    VkCommandBuffer cb = Commands();
     uint32_t address = Register(reg::kRbCopyDestBase) & 0x1FFFFFFF;
     uint32_t destPitch = Register(reg::kRbCopyDestPitch);
     uint32_t width = destPitch & 0x3FFF, height = destPitch >> 16 & 0x3FFF;
     uint32_t format = Register(reg::kRbCopyDestInfo) >> 7 & 0x3F;
     int32_t row = 0, sx, sy, dx, dy, w, h;
-    VkCommandBuffer cb = Commands();
-    Image* dest = width && height ? DestinationTexture(address, width, height, VK_FORMAT_R32_SFLOAT, format, cb, row) : nullptr;
-    if (!dest || !ClampCopy(edram, row, source, *dest, sx, sy, dx, dy, w, h)) {
+    Texture* texture = width && height && SetUpDepthPass()
+                           ? DestinationTexture(address, width, height, VK_FORMAT_R8G8B8A8_UNORM, format, cb, row, true)
+                           : nullptr;
+    VkDescriptorSet set = texture ? DepthPassSet(source, *texture) : VK_NULL_HANDLE;
+    if (!set || !ClampCopy(edram, row, source, texture->image, sx, sy, dx, dy, w, h)) {
         ++gSkippedResolves;
         return;
     }
-    backend::Upload upload;
-    cb = backend::Allocate(VkDeviceSize(w) * h * 4, upload);
-    if (!cb) return;
-    VkBufferImageCopy region{};
-    region.bufferOffset = upload.offset;
-    region.imageSubresource = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1};
-    region.imageOffset = {sx, sy, 0};
-    region.imageExtent = {uint32_t(w), uint32_t(h), 1};
-    vkCmdCopyImageToBuffer(cb, source.image, VK_IMAGE_LAYOUT_GENERAL, upload.buffer, 1, &region);
     FullBarrier(cb);
-    region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-    region.imageOffset = {dx, dy, 0};
-    vkCmdCopyBufferToImage(cb, upload.buffer, dest->image, VK_IMAGE_LAYOUT_GENERAL, 1, &region);
+    bool msaa = source.samples != VK_SAMPLE_COUNT_1_BIT;
+    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, gDepthPass.pipelines[msaa]);
+    vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, gDepthPass.layout, 0, 1, &set, 0, nullptr);
+    int32_t rect[6] = {sx, sy, dx, dy, w, h};
+    vkCmdPushConstants(cb, gDepthPass.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof rect, rect);
+    vkCmdDispatch(cb, uint32_t(w + 7) / 8, uint32_t(h + 7) / 8, 1);
     FullBarrier(cb);
     Operation();
     ++gResolves;
 }
-
 // Copies `edram` from the render target to the resolve's destination texture, at the same
 // position from the destination's address.
 void CopyOut(VkCommandBuffer cb, Image& source, Rect edram) {
@@ -630,11 +752,12 @@ void CopyOut(VkCommandBuffer cb, Image& source, Rect edram) {
     uint32_t width = destPitch & 0x3FFF, height = destPitch >> 16 & 0x3FFF;
     uint32_t format = Register(reg::kRbCopyDestInfo) >> 7 & 0x3F;
     int32_t row = 0;
-    Image* dest = width && height ? DestinationTexture(address, width, height, source.format, format, cb, row) : nullptr;
-    if (!dest) {
+    Texture* texture = width && height ? DestinationTexture(address, width, height, source.format, format, cb, row) : nullptr;
+    if (!texture) {
         ++gSkippedResolves;
         return;
     }
+    Image* dest = &texture->image;
     int32_t sx, sy, dx, dy, w, h;
     if (!ClampCopy(edram, row, source, *dest, sx, sy, dx, dy, w, h)) return;
     if (source.samples != VK_SAMPLE_COUNT_1_BIT) {
@@ -769,10 +892,10 @@ void Resolve() {
         }
         if (color)
             CopyOut(cb, *color, edram);
-        else if (depth && depth->samples == VK_SAMPLE_COUNT_1_BIT && depth->format == VK_FORMAT_D32_SFLOAT_S8_UINT)
-            CopyDepthOut(*depth, edram);
+        else if (depth)
+            DepthOut(*depth, edram);
         else
-            ++gSkippedResolves;  // depth resolves from MSAA targets come later
+            ++gSkippedResolves;
     }
 
     // Clears after the copy: colour packed as ARGB, depth as 24-bit depth and stencil.
