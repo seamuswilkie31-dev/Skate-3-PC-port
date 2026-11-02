@@ -7,7 +7,9 @@
 
 #include "render/vulkan.h"
 
+#include <cstddef>
 #include <cstdint>
+#include <cstring>
 
 namespace s3n::render::backend {
 
@@ -40,6 +42,23 @@ VkCommandBuffer Allocate(VkDeviceSize size, Upload& upload);
 
 // Frames finished so far (swaps handled).
 uint64_t FrameNumber();
+
+// A hash of guest memory, fast enough to check what textures and vertices were made from
+// once a frame: four independent multiply-xorshift lanes over 8-byte words.
+inline uint64_t HashMemory(const uint8_t* data, size_t size) {
+    uint64_t lanes[4] = {0x9E3779B97F4A7C15ull, 0xC2B2AE3D27D4EB4Full, 0x165667B19E3779F9ull, size};
+    size_t i = 0;
+    for (; i + 32 <= size; i += 32) {
+        for (int l = 0; l < 4; ++l) {
+            uint64_t v;
+            std::memcpy(&v, data + i + l * 8, 8);
+            lanes[l] = (lanes[l] ^ v) * 0xFF51AFD7ED558CCDull;
+            lanes[l] ^= lanes[l] >> 29;
+        }
+    }
+    for (; i < size; ++i) lanes[0] = (lanes[0] ^ data[i]) * 0x100000001B3ull;
+    return lanes[0] ^ lanes[1] * 31 ^ lanes[2] * 961 ^ lanes[3] * 29791;
+}
 
 // The texture a resolve last wrote at this physical address, or nullptr. serial changes
 // whenever the image is made again.

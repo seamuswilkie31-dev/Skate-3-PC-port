@@ -639,12 +639,36 @@ as before, and the title screen's 3D scene now shows its skater too. In a
   `k_24_8` textures, and those are white for now, so there are no shadows.
 - **The world** ("Play Skate 3").
 
+## In the world: first speed work
+
+"Play Skate 3!" now leads into the game. A save that has finished the
+new-player flow boots straight to Port Carverton, where the skater rides with
+Coach Frank's tips. It rendered at about 3 fps:
+- **Converted vertices are cached.** Converting vertices on the CPU took 87 of
+  the command processor's 91 s. Runs of 64 vertices or more are now kept by
+  their bound layout and range, and checked once a frame against a hash of
+  their source memory. Result: about 19 fps in game.
+- **WAIT_REG_MEM wakes when the interrupt handler returns.** It used to poll
+  with `Sleep(1)`, so each interrupt round trip cost 1.5–1.9 ms; now it costs
+  tens of microseconds. The remaining wait is the vsync flip.
+- **The ring's read pointer moves per packet**, and past an indirect buffer
+  before its commands run, as the GPU's prefetch would move it.
+
+**Diagnostics:** the report gives each thread's CPU time, the command
+processor's idle, wait and swap time, and its time in draws by phase.
+`--profile-thread n` samples a guest thread's link register. Frame dumps say
+when they were taken, for timing `--press`.
+
+**Next for speed:** faster vertex conversion and index reading, constants
+uploaded only when they change, converted vertices kept on the GPU.
+
 ## Next
 
 1. **Input** (phase 4): done, see [PHASE4.md](PHASE4.md). Start and A now get
    the game past the title screen and its autosave notice, to the storage
    device prompt.
-2. **Rendering, continued:** depth resolves (shadows), then the world.
+2. **Rendering, continued:** speed, depth resolves (shadows), the black sky,
+   and one unknown pixel shader seen in the world.
 3. **Audio output** (phase 4): real XMA decoding behind the same context
    interface, and the render driver's frames played through SDL3.
 4. **Saves and DLC** (phase 5): the hard drive and cache partitions, the

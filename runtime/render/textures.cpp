@@ -175,23 +175,6 @@ uint32_t Tiled2D(uint32_t x, uint32_t y, uint32_t pitch, uint32_t log2Bytes) {
            (bytes >> 8) << 12;
 }
 
-// Fast enough to check every texture once a frame: four independent multiply-xorshift
-// lanes over 8-byte words.
-uint64_t Hash(const uint8_t* data, size_t size) {
-    uint64_t lanes[4] = {0x9E3779B97F4A7C15ull, 0xC2B2AE3D27D4EB4Full, 0x165667B19E3779F9ull, size};
-    size_t i = 0;
-    for (; i + 32 <= size; i += 32) {
-        for (int l = 0; l < 4; ++l) {
-            uint64_t v;
-            std::memcpy(&v, data + i + l * 8, 8);
-            lanes[l] = (lanes[l] ^ v) * 0xFF51AFD7ED558CCDull;
-            lanes[l] ^= lanes[l] >> 29;
-        }
-    }
-    for (; i < size; ++i) lanes[0] = (lanes[0] ^ data[i]) * 0x100000001B3ull;
-    return lanes[0] ^ lanes[1] * 31 ^ lanes[2] * 961 ^ lanes[3] * 29791;
-}
-
 uint32_t Log2(uint32_t value) {
     uint32_t log = 0;
     while ((1u << log) < value) ++log;
@@ -402,7 +385,7 @@ Slots Bind(uint32_t index) {
     uint64_t frame = FrameNumber();
     if (created || texture.checkedFrame != frame) {
         texture.checkedFrame = frame;
-        uint64_t hash = Hash(source, span);
+        uint64_t hash = HashMemory(source, span);
         if (created || hash != texture.hash) {
             size_t size = size_t(blocksWide) * blocksHigh * info.bytes;
             Upload upload;

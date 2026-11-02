@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstring>
 #include <mutex>
@@ -124,6 +125,23 @@ bool gUnavailable = false;
 VkPipelineLayout gPipelineLayout = VK_NULL_HANDLE;
 VkPipelineCache gPipelineCache = VK_NULL_HANDLE;
 
+// Where the command processor's time in draws goes, for the report.
+enum Phase { kPhaseIndices, kPhaseTextures, kPhaseUpload, kPhaseVertices, kPhaseRecording, kPhaseCount };
+constexpr const char* kPhaseNames[kPhaseCount] = {"indices", "textures", "upload space", "vertices", "recording"};
+std::array<std::atomic<uint64_t>, kPhaseCount> gPhaseNanoseconds{};
+std::atomic<uint64_t> gVerticesConverted{0};
+std::atomic<uint64_t> gVertexHits{0}, gVertexMisses{0};  // the vertex cache's
+
+// Adds the time since the last lap to a phase.
+struct Laps {
+    std::chrono::steady_clock::time_point last = std::chrono::steady_clock::now();
+    void operator()(Phase phase) {
+        auto now = std::chrono::steady_clock::now();
+        gPhaseNanoseconds[phase] += std::chrono::duration_cast<std::chrono::nanoseconds>(now - last).count();
+        last = now;
+    }
+};
+
 std::string Describe() {
     std::string out = "draws: " + std::to_string(gDrawn.load()) + " drawn with " + std::to_string(gPipelineCount.load()) +
                       " pipelines; skipped:";
@@ -134,7 +152,15 @@ std::string Describe() {
             any = true;
         }
     }
-    return out + (any ? "\n" : " none\n");
+    out += any ? "\n" : " none\n";
+    char line[64];
+    out += "  time in draws:";
+    for (int i = 0; i < kPhaseCount; ++i) {
+        std::snprintf(line, sizeof line, "%s %s %.1f s", i ? "," : "", kPhaseNames[i], gPhaseNanoseconds[i] / 1e9);
+        out += line;
+    }
+    return out + " (" + std::to_string(gVerticesConverted.load()) + " vertices converted; vertex cache " +
+           std::to_string(gVertexHits.load()) + " hits, " + std::to_string(gVertexMisses.load()) + " misses)\n";
 }
 
 float RegisterFloat(uint32_t index) {
@@ -396,6 +422,96 @@ void ConvertVertices(const std::vector<Fetch>& fetches, uint32_t first, uint32_t
     }
 }
 
+// Converted vertices, kept between draws. Most of the world is drawn every frame, and again
+// in each pass (shadows, reflections), from the same vertex buffers, so each run of
+// vertices is converted once and checked once a frame against a hash of the memory it came
+// from. Small draws (the interface, effects) are converted every time.
+constexpr uint32_t kCachedVertices = 64;  // the fewest vertices a draw needs to be cached
+constexpr uint64_t kCacheFrames = 120;    // an entry unused for this many frames is dropped
+
+struct VertexEntry {
+    std::vector<Fetch> fetches;  // as bound: with first and count, the key
+    uint32_t first = 0, count = 0;
+    uint64_t sourceHash = 0;
+    uint64_t checkedFrame = ~0ull, usedFrame = 0;
+    std::vector<uint8_t> data;  // as ConvertVertices writes it
+};
+std::unordered_map<uint64_t, VertexEntry> gVertexCache;
+uint64_t gVertexCacheSwept = 0;
+
+bool SameFetch(const Fetch& a, const Fetch& b) {
+    return a.location == b.location && a.usage == b.usage && a.valid == b.valid && a.base == b.base && a.end == b.end &&
+           a.endian == b.endian && a.format == b.format && a.isSigned == b.isSigned && a.isInteger == b.isInteger &&
+           a.exponent == b.exponent && a.stride == b.stride && a.offset == b.offset && a.swizzle == b.swizzle &&
+           a.shaderSwizzle == b.shaderSwizzle;
+}
+
+uint64_t VertexKey(const std::vector<Fetch>& fetches, uint32_t first, uint32_t count) {
+    uint64_t hash = 0xCBF29CE484222325ull;
+    auto mix = [&hash](uint64_t value) {
+        hash = (hash ^ value) * 0x100000001B3ull;
+        hash ^= hash >> 31;
+    };
+    mix(uint64_t(first) << 32 | count);
+    for (const Fetch& f : fetches) {
+        mix(uint64_t(f.base) << 32 | f.end);
+        mix(uint64_t(f.format) | uint64_t(f.endian) << 8 | uint64_t(f.isSigned) << 10 | uint64_t(f.isInteger) << 11 |
+            uint64_t(f.valid) << 12 | uint64_t(f.location) << 16 | uint64_t(f.usage) << 24 |
+            uint64_t(uint32_t(f.exponent)) << 32);
+        mix(uint64_t(f.stride) << 32 | uint32_t(f.offset));
+        mix(uint64_t(f.swizzle) << 32 | f.shaderSwizzle);
+    }
+    return hash;
+}
+
+// A hash of the memory the vertices come from: each vertex buffer's span of them.
+uint64_t SourceHash(const std::vector<Fetch>& fetches, uint32_t first, uint32_t count) {
+    uint64_t hash = 0;
+    std::pair<uint32_t, uint32_t> done[kMaxAttributes];  // buffer and stride
+    uint32_t doneCount = 0;
+    for (const Fetch& f : fetches) {
+        if (!f.valid || std::find(done, done + doneCount, std::pair{f.base, f.stride}) != done + doneCount) continue;
+        done[doneCount++] = {f.base, f.stride};
+        uint64_t start = f.stride ? uint64_t(f.base) + uint64_t(first) * f.stride * 4 : f.base + int64_t(f.offset) * 4;
+        uint64_t end = std::min<uint64_t>(f.stride ? start + uint64_t(count) * f.stride * 4 : start + 16, f.end);
+        if (start < f.base || start >= end) continue;
+        hash = hash * 31 ^ HashMemory(gpu::PhysicalMemory(uint32_t(start)), size_t(end - start));
+    }
+    return hash;
+}
+
+// ConvertVertices, through the cache.
+void CachedVertices(const std::vector<Fetch>& fetches, uint32_t first, uint32_t count, uint8_t* out) {
+    size_t size = size_t(count) * fetches.size() * 16;
+    uint64_t frame = FrameNumber();
+    VertexEntry& entry = gVertexCache[VertexKey(fetches, first, count)];
+    bool same = entry.first == first && entry.count == count && entry.fetches.size() == fetches.size() &&
+                std::equal(fetches.begin(), fetches.end(), entry.fetches.begin(), SameFetch);
+    if (same && entry.checkedFrame != frame) {
+        entry.checkedFrame = frame;
+        same = SourceHash(fetches, first, count) == entry.sourceHash;
+    }
+    if (same) {
+        ++gVertexHits;
+    } else {
+        ++gVertexMisses;
+        entry.fetches = fetches;
+        entry.first = first;
+        entry.count = count;
+        entry.sourceHash = SourceHash(fetches, first, count);
+        entry.checkedFrame = frame;
+        entry.data.resize(size);
+        ConvertVertices(fetches, first, count, entry.data.data());
+        gVerticesConverted += count;
+    }
+    entry.usedFrame = frame;
+    std::memcpy(out, entry.data.data(), size);
+    if (frame >= gVertexCacheSwept + kCacheFrames / 2) {
+        gVertexCacheSwept = frame;
+        std::erase_if(gVertexCache, [frame](const auto& item) { return item.second.usedFrame + kCacheFrames < frame; });
+    }
+}
+
 VkBlendFactor BlendFactor(uint32_t factor) {
     static constexpr VkBlendFactor kFactors[17] = {
         VK_BLEND_FACTOR_ZERO,           VK_BLEND_FACTOR_ONE,
@@ -541,6 +657,8 @@ size_t Align(size_t value) { return (value + 255) & ~size_t(255); }
 }  // namespace
 
 void Draw(const DrawCall& call) {
+    Laps lap;
+
     // Where it draws.
     uint32_t mode = Register(reg::kRbModeControl) & 7;
     if (mode != reg::kEdramModeColorDepth && mode != reg::kEdramModeDepth) {
@@ -612,6 +730,7 @@ void Draw(const DrawCall& call) {
             for (size_t i : {0, 1, 2, 0, 2, 3}) indices.push_back(quads[q + i]);
         if (indices.empty()) return;
     }
+    lap(kPhaseIndices);
     uint32_t vertexCount = last - first + 1;
     if (vertexCount > kMaxVertices) {
         ++gSkipped[kTooBig];
@@ -632,6 +751,7 @@ void Draw(const DrawCall& call) {
     uint32_t textureMask = (call.vertexShader->textureFetchMask | call.pixelShader->textureFetchMask) & 0xFFFF;
     for (uint32_t s = 0; s < 16; ++s)
         if (textureMask >> s & 1) slots[s] = textures::Bind(s);
+    lap(kPhaseTextures);
 
     // Everything the draw reads, in one block of the upload ring: both stages' constants,
     // the shared constants, the vertices and the indices.
@@ -644,6 +764,7 @@ void Draw(const DrawCall& call) {
         ++gSkipped[kNoWindow];
         return;
     }
+    lap(kPhaseUpload);
     const uint32_t* registers = gpu::ConstantRegisters();
     std::memcpy(upload.data, registers + reg::kAluConstants, kStageConstantsSize);
     std::memcpy(upload.data + kStageConstantsSize, registers + reg::kPixelAluConstants, kStageConstantsSize);
@@ -670,8 +791,14 @@ void Draw(const DrawCall& call) {
                      (call.pixelShader->specConstantsMask & kSpecAlphaTest);
     float alphaReference = RegisterFloat(reg::kRbAlphaRef);
     std::memcpy(shared + kSharedAlphaThreshold, &alphaReference, 4);
-    ConvertVertices(fetches, first, vertexCount, upload.data + vertexAt);
+    if (vertexCount >= kCachedVertices) {
+        CachedVertices(fetches, first, vertexCount, upload.data + vertexAt);
+    } else {
+        ConvertVertices(fetches, first, vertexCount, upload.data + vertexAt);
+        gVerticesConverted += vertexCount;
+    }
     if (!indices.empty()) std::memcpy(upload.data + indexAt, indices.data(), indices.size() * 4);
+    lap(kPhaseVertices);
 
     // The render targets.
     uint32_t surface = Register(reg::kRbSurfaceInfo), pitch = surface & 0x3FFF, msaa = surface >> 16 & 3;
@@ -797,6 +924,7 @@ void Draw(const DrawCall& call) {
     }
     Operation();
     ++gDrawn;
+    lap(kPhaseRecording);
 }
 
 }  // namespace s3n::render

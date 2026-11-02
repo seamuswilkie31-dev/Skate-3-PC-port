@@ -11,9 +11,12 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstring>
 #include <memory>
 #include <mutex>
+#include <string>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -262,6 +265,64 @@ void SetWaitState(const char* caller, uint32_t object) {
     tCurrent->waitingIn = caller;
 }
 
+namespace {
+
+// --profile-thread: samples of one guest thread's link register, the return address of
+// the last call it made, which places it in the function it's in (or, in a loop without
+// calls, just after the last call before it). Key 0: waiting in the kernel.
+uint32_t gProfiledThread = 0;
+std::mutex gProfileMutex;
+std::unordered_map<uint32_t, uint64_t> gProfile;
+
+void Profiler() {
+    Thread* thread = nullptr;
+    for (;;) {
+        std::this_thread::sleep_for(std::chrono::microseconds(500));
+        if (!thread) {
+            std::lock_guard lock(gThreadsMutex);
+            for (const auto& t : gThreads)
+                if (t->number == gProfiledThread) thread = t.get();
+            continue;
+        }
+        if (thread->exited) return;
+        PPCContext* c = thread->ctx;
+        if (!c) continue;
+        uint32_t key = thread->waitingIn ? 0 : uint32_t(c->lr);
+        std::lock_guard lock(gProfileMutex);
+        ++gProfile[key];
+    }
+}
+
+std::string DescribeProfile() {
+    std::unique_lock lock(gProfileMutex, std::try_to_lock);
+    if (!lock.owns_lock()) return "profile: (busy)\n";
+    std::vector<std::pair<uint32_t, uint64_t>> samples(gProfile.begin(), gProfile.end());
+    lock.unlock();
+    uint64_t total = 0;
+    for (const auto& s : samples) total += s.second;
+    std::sort(samples.begin(), samples.end(), [](auto& a, auto& b) { return a.second > b.second; });
+    std::string out = "profile of t" + std::to_string(gProfiledThread) + ": " + std::to_string(total) +
+                      " samples, by the return address of its last call\n";
+    char line[96];
+    for (size_t i = 0; i < samples.size() && i < 30; ++i) {
+        if (samples[i].first)
+            std::snprintf(line, sizeof line, "  %08X  %5.1f%%\n", samples[i].first, 100.0 * samples[i].second / total);
+        else
+            std::snprintf(line, sizeof line, "  waiting   %5.1f%%\n", 100.0 * samples[i].second / total);
+        out += line;
+    }
+    return out;
+}
+
+}  // namespace
+
+void ProfileThread(uint32_t number) {
+    if (!number || gProfiledThread) return;
+    gProfiledThread = number;
+    AddReportSection(DescribeProfile);
+    std::thread(Profiler).detach();
+}
+
 std::string DescribeThreads() {
     std::unique_lock lock(gThreadsMutex, std::try_to_lock);
     if (!lock.owns_lock()) return "  (thread list busy)\n";
@@ -269,8 +330,13 @@ std::string DescribeThreads() {
     std::string out;
     char line[256];
     for (const auto& t : gThreads) {
-        int n = std::snprintf(line, sizeof line, "  t%-3u %-22.22s entry %08X  ", t->number,
-                              t->start.main ? "(main)" : t->name.c_str(), t->start.entry);
+        FILETIME created, exited, kernelTime, userTime;  // CPU time, in 100 ns units
+        double cpu = 0.0;
+        auto ticks = [](const FILETIME& f) { return uint64_t(f.dwHighDateTime) << 32 | f.dwLowDateTime; };
+        if (t->host && GetThreadTimes(t->host, &created, &exited, &kernelTime, &userTime))
+            cpu = double(ticks(kernelTime) + ticks(userTime)) / 1e7;
+        int n = std::snprintf(line, sizeof line, "  t%-3u %-22.22s entry %08X  cpu %6.1f s  ", t->number,
+                              t->start.main ? "(main)" : t->name.c_str(), t->start.entry, cpu);
         if (t->exited) {
             std::snprintf(line + n, sizeof line - n, "exited, code %08X\n", t->exitCode.load());
         } else if (t->suspendCount > 0) {

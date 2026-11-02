@@ -110,8 +110,11 @@ void CallGuest(PPCContext& ctx, uint8_t* base, uint32_t function, uint32_t r3, u
 // Records what the calling thread is blocked in (nullptr: running again), for reports.
 void SetWaitState(const char* caller, uint32_t object);
 
-// One line per guest thread: entry, state, registers. Never blocks.
+// One line per guest thread: entry, CPU time, state, registers. Never blocks.
 std::string DescribeThreads();
+
+// --profile-thread: samples where guest thread `number` is, for the report.
+void ProfileThread(uint32_t number);
 
 // ---- Kernel objects, handles and waits (dispatcher.cpp) ----
 

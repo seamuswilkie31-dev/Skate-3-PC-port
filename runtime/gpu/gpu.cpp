@@ -92,6 +92,11 @@ std::atomic<uint32_t> gCallbackData{0};
 std::atomic<bool> gInterruptThreadStarted{false};
 std::mutex gInterruptMutex;
 std::condition_variable gInterruptWake;
+// Calls to the title's interrupt handler that have returned: a WAIT_REG_MEM is usually
+// waiting for one of them to write its value.
+std::mutex gCallbackMutex;
+std::condition_variable gCallbackDone;
+uint64_t gCallbacksDone = 0;  // under gCallbackMutex
 std::deque<std::pair<uint32_t, uint32_t>> gInterrupts;  // (source, processor)
 
 // Counters for the report.
@@ -293,6 +298,7 @@ struct Stream {
 };
 
 bool ExecuteStream(Stream& s, int depth);
+void ReportRead(uint32_t index);
 
 void QueueInterrupt(uint32_t source, uint32_t processor) {
     {
@@ -302,13 +308,25 @@ void QueueInterrupt(uint32_t source, uint32_t processor) {
     gInterruptWake.notify_one();
 }
 
+// Where the command processor's time goes besides executing packets, for the report.
+std::atomic<uint64_t> gIdleNanoseconds{0}, gWaitNanoseconds{0}, gSwapNanoseconds{0};
+
 // WAIT_REG_MEM: blocks the command processor until a register or memory word compares
 // true against the reference.
 void WaitRegMem(uint32_t info, uint32_t target, uint32_t reference, uint32_t mask, uint32_t interval) {
     bool memory = info & 0x10;
     Clock::time_point start = Clock::now();
+    struct Timed {
+        Clock::time_point start;
+        ~Timed() { gWaitNanoseconds += std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - start).count(); }
+    } timed{start};
     bool warned = false;
     for (;;) {
+        uint64_t callbacks;
+        {
+            std::lock_guard lock(gCallbackMutex);
+            callbacks = gCallbacksDone;
+        }
         SyncScratchRegisters();
         uint32_t value;
         if (memory) {
@@ -326,8 +344,13 @@ void WaitRegMem(uint32_t info, uint32_t target, uint32_t reference, uint32_t mas
                         memory ? "memory" : "register", target, mask, info & 7, reference, value);
             warned = true;
         }
-        if (interval >= 0x100) Sleep(1);
-        else SwitchToThread();
+        if (interval < 0x100) {
+            SwitchToThread();
+            continue;
+        }
+        // Woken when the interrupt handler returns; anything else is seen within a millisecond.
+        std::unique_lock lock(gCallbackMutex);
+        gCallbackDone.wait_for(lock, std::chrono::milliseconds(1), [callbacks] { return gCallbacksDone != callbacks; });
     }
     gWaitingOn = 0;
 }
@@ -354,6 +377,7 @@ bool ExecuteType3(Stream& s, uint32_t header, int depth) {
         uint32_t address = s.Read();
         uint32_t length = s.Read() & 0xFFFFF;
         if (gTracePackets) kernel::Log("  gpu indirect buffer %08X, %u dwords\n", address, length);
+        if (depth == 0) ReportRead((s.position + s.remaining - end) % s.sizeDwords);  // its commands aren't in the ring
         if (depth < 4 && length) {
             Stream indirect{Physical(address), length, 0, length};
             ExecuteStream(indirect, depth + 1);
@@ -488,7 +512,9 @@ bool ExecuteType3(Stream& s, uint32_t header, int depth) {
     case kNop:  // VdSwap's marker (gpu.h) ends a frame
         if (count >= 4 && s.Read() == kSwapMarker) {
             uint32_t frontBuffer = s.Read(), width = s.Read(), height = s.Read();
+            Clock::time_point start = Clock::now();
             render::Swap(frontBuffer, width, height);
+            gSwapNanoseconds += std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - start).count();
         }
         break;
     case kMeInit:
@@ -559,13 +585,25 @@ bool ExecuteStream(Stream& s, int depth) {
             s.Skip(s.remaining);
             return false;
         }
+        if (depth == 0) ReportRead(s.position);
     }
     return true;
 }
 
+// The read pointer, as far as the ring has been read. The title waits on it for space to
+// write more, so it moves with each packet, as the GPU's prefetch would move it.
+void ReportRead(uint32_t index) {
+    gReadIndex = index;
+    WriteRegister(kCpRbRptr, index);
+    if (uint32_t writeBack = gWriteBack) *reinterpret_cast<uint32_t*>(Physical(writeBack)) = __builtin_bswap32(index);
+}
+
 // Consumes the ring buffer: everything between our read index and the write index the
-// title stores in CP_RB_WPTR, then reports the new read index.
+// title stores in CP_RB_WPTR.
+HANDLE gProcessorThread = nullptr;  // for its CPU time in the report
+
 void CommandProcessor() {
+    gProcessorThread = OpenThread(THREAD_QUERY_LIMITED_INFORMATION, FALSE, GetCurrentThreadId());
     uint32_t idle = 0;
     for (;;) {
         SyncScratchRegisters();
@@ -573,16 +611,16 @@ void CommandProcessor() {
         uint32_t write = size ? ReadRegister(kCpRbWptr) % size : 0;
         uint32_t read = gReadIndex;
         if (!size || write == read) {
+            Clock::time_point start = Clock::now();
             if (++idle < 200) SwitchToThread();
             else Sleep(1);
+            gIdleNanoseconds += std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - start).count();
             continue;
         }
         idle = 0;
         Stream ring{Physical(gRingBase), size, read, (write + size - read) % size};
         ExecuteStream(ring, 0);
-        gReadIndex = write;
-        WriteRegister(kCpRbRptr, write);
-        if (uint32_t writeBack = gWriteBack) *reinterpret_cast<uint32_t*>(Physical(writeBack)) = __builtin_bswap32(write);
+        ReportRead(write);
     }
 }
 
@@ -615,6 +653,11 @@ void InterruptThread(PPCContext& ctx, uint8_t* base) {
             kernel::SetCurrentProcessor(uint8_t(interrupt.second));
             kernel::CallGuest(ctx, base, callback, interrupt.first, gCallbackData, 0);
             ++gInterruptsDelivered;
+            {
+                std::lock_guard lock(gCallbackMutex);
+                ++gCallbacksDone;
+            }
+            gCallbackDone.notify_all();
             if (interrupt.first != 0 && gLoggedInterrupts < 8) {
                 ++gLoggedInterrupts;
                 kernel::Log("  gpu: interrupt for processor %u handled; scratch 0 is %08X in the register, %08X in memory\n",
@@ -632,8 +675,15 @@ std::string Describe() {
                   gRingBase.load(), gRingDwords.load(), gReadIndex.load(),
                   gRingDwords ? ReadRegister(kCpRbWptr) % gRingDwords : 0, gWriteBack.load());
     out += line;
-    std::snprintf(line, sizeof line, "  %u vertical blanks, %llu interrupts delivered, %u swaps, %llu draws\n",
-                  gVblanks.load(), gInterruptsDelivered.load(), gSwaps.load(), gDraws.load());
+    FILETIME created, exited, kernelTime, userTime;
+    auto ticks = [](const FILETIME& f) { return uint64_t(f.dwHighDateTime) << 32 | f.dwLowDateTime; };
+    double cpu = gProcessorThread && GetThreadTimes(gProcessorThread, &created, &exited, &kernelTime, &userTime)
+                     ? double(ticks(kernelTime) + ticks(userTime)) / 1e7
+                     : 0.0;
+    std::snprintf(line, sizeof line, "  %u vertical blanks, %llu interrupts delivered, %u swaps, %llu draws; command processor cpu %.1f s, idle %.1f s, "
+                  "in WAIT_REG_MEM %.1f s, in swaps %.1f s\n",
+                  gVblanks.load(), gInterruptsDelivered.load(), gSwaps.load(), gDraws.load(), cpu, gIdleNanoseconds / 1e9,
+                  gWaitNanoseconds / 1e9, gSwapNanoseconds / 1e9);
     out += line;
     if (uint32_t target = gWaitingOn) {
         std::snprintf(line, sizeof line, "  waiting on %s %08X\n", gWaitingOnMemory ? "memory" : "register", target);

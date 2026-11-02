@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstring>
 #include <deque>
@@ -113,6 +114,7 @@ Image* gOpenColor = nullptr;
 Image* gOpenDepth = nullptr;
 
 uint32_t gDumpInterval = 0;
+const auto gStart = std::chrono::steady_clock::now();  // dumps say when, to time --press by
 uint64_t gCaptureFrame = 0;
 std::string gDumpFolder;
 
@@ -780,7 +782,9 @@ void Swap(uint32_t frontBuffer, uint32_t width, uint32_t height) {
         WriteBmp(std::filesystem::path(gDumpFolder) / ("frame_" + std::to_string(frame) + ".bmp"),
                  static_cast<const uint8_t*>(pixels), width, height);
         vkUnmapMemory(Vk().device, readback.memory);
-        kernel::Log("  targets: frame %llu dumped (%s)\n", frame, front ? "front buffer" : "no front buffer yet");
+        kernel::Log("  targets: frame %llu dumped at %.1f s (%s)\n", frame,
+                    std::chrono::duration<double>(std::chrono::steady_clock::now() - gStart).count(),
+                    front ? "front buffer" : "no front buffer yet");
     }
     DestroyReadback(readback);
 }

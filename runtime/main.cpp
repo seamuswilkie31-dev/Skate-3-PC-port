@@ -3,14 +3,15 @@
 //   s3native [--game <iso or folder>] [--xex <default.xex>] [--log <file>]
 //            [--stall <seconds>] [--time-limit <seconds>] [--watch <hex address>]
 //            [--watch-reads <hex address>] [--no-window] [--dump-frames <interval>]
-//            [--capture-frame <frame>] [--press <button:seconds,...>]
+//            [--capture-frame <frame>] [--press <button:seconds,...>] [--profile-thread <n>]
 //
 // Loads the game, mounts its disc (--game, or the launcher's choice in config.ini),
 // opens the game window, starts the entry point on a guest main thread, and logs every
 // kernel call. Guest threads run on host threads; imports we haven't implemented are
 // logged stubs returning 0. The run ends through kernel::Finish, which prints a report.
 // --dump-frames n writes every nth frame to <work>\frames as a BMP; --capture-frame n logs every
-// clear, resolve and draw of frame n; --press presses pad buttons on a schedule (input.h).
+// clear, resolve and draw of frame n; --press presses pad buttons on a schedule (input.h);
+// --profile-thread n samples where guest thread n spends its time.
 
 #include "apu/xma.h"
 #include "config.h"
@@ -64,6 +65,7 @@ int main(int argc, char** argv) {
         else if (key == "--press") presses = argv[i + 1];
         else if (key == "--capture-frame") render::CaptureFrame(std::strtoull(argv[i + 1], nullptr, 10));
         else if (key == "--dump-frames") render::DumpFrames(uint32_t(std::atoi(argv[i + 1])), DefaultWorkPath("frames"));
+        else if (key == "--profile-thread") kernel::ProfileThread(uint32_t(std::atoi(argv[i + 1])));
         else if (key == "--watch") options.watchAddress = uint32_t(std::strtoul(argv[i + 1], nullptr, 16));
         else if (key == "--watch-reads") {
             options.watchAddress = uint32_t(std::strtoul(argv[i + 1], nullptr, 16));
