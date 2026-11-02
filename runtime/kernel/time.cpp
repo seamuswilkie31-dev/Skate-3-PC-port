@@ -161,6 +161,37 @@ PPC_FUNC(__imp__KeQuerySystemTime) {
     if (ctx.r3.u32) StoreBE64(base, ctx.r3.u32, SystemTime());
 }
 
+// TIME_FIELDS: year, month, day, hour, minute, second, milliseconds, weekday (s16 each).
+// The times are FILETIMEs: 100 ns units since 1601, as on Windows.
+
+// void RtlTimeToTimeFields(s64* time, TIME_FIELDS* fields)
+PPC_FUNC(__imp__RtlTimeToTimeFields) {
+    Trace(ctx, "RtlTimeToTimeFields", true);
+    uint64_t time = LoadBE64(base, ctx.r3.u32);
+    FILETIME file{DWORD(time), DWORD(time >> 32)};
+    SYSTEMTIME s{};
+    FileTimeToSystemTime(&file, &s);
+    const uint16_t fields[8] = {s.wYear, s.wMonth, s.wDay, s.wHour, s.wMinute, s.wSecond, s.wMilliseconds, s.wDayOfWeek};
+    for (int i = 0; i < 8; ++i) {
+        base[ctx.r4.u32 + i * 2] = uint8_t(fields[i] >> 8);
+        base[ctx.r4.u32 + i * 2 + 1] = uint8_t(fields[i]);
+    }
+}
+
+// BOOLEAN RtlTimeFieldsToTime(TIME_FIELDS* fields, s64* time)
+PPC_FUNC(__imp__RtlTimeFieldsToTime) {
+    Trace(ctx, "RtlTimeFieldsToTime", true);
+    auto field = [&](int i) { return uint16_t(base[ctx.r3.u32 + i * 2] << 8 | base[ctx.r3.u32 + i * 2 + 1]); };
+    SYSTEMTIME s{field(0), field(1), field(7), field(2), field(3), field(4), field(5), field(6)};
+    FILETIME file;
+    if (!SystemTimeToFileTime(&s, &file)) {
+        ctx.r3.u64 = 0;
+        return;
+    }
+    StoreBE64(base, ctx.r4.u32, uint64_t(file.dwHighDateTime) << 32 | file.dwLowDateTime);
+    ctx.r3.u64 = 1;
+}
+
 // NTSTATUS NtCreateTimer(HANDLE* out, OBJECT_ATTRIBUTES* attributes, u32 type)
 // type 0: notification, 1: synchronization. Names aren't supported for timers yet.
 PPC_FUNC(__imp__NtCreateTimer) {

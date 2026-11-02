@@ -76,10 +76,9 @@ path.
 
 ## Next
 
-1. **Saves (phase 5, brought forward):** a storage device for the device
-   selector, the content APIs (`XamContentCreateEx` and the rest) backed by
-   `%APPDATA%\Skate3Native\saves`, and profile settings. That's what gets
-   past the storage prompt to the menus and the game.
+1. **Saves (phase 5, brought forward):** done, see [PHASE5.md](PHASE5.md). The
+   game now gets past the storage prompt, creates and reloads its save, and
+   plays the new-player flow into the skater editor.
 2. **Keyboard and mouse bindings in the launcher**, next to the pad tester,
    and tuning the mouse's flick feel on real tricks.
 3. **Audio:** real XMA decoding behind the existing context interface, and

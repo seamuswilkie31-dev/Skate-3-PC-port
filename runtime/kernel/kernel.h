@@ -8,6 +8,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <filesystem>
 #include <optional>
 #include <string>
 
@@ -170,6 +171,11 @@ uint32_t WaitForObjects(PPCContext& ctx, uint8_t* base, const char* caller, cons
 
 // The game disc, served as d:\, game:\ and \Device\Cdrom0.
 void MountDisc(const Disc* disc);
+
+// A host folder served as a writable device ("save" becomes save:\), as a content
+// package's root is. Unmounting doesn't close files already open there.
+void MountFolder(const std::string& name, const std::filesystem::path& folder);
+bool UnmountFolder(const std::string& name);
 
 // ---- Time (time.cpp) ----
 

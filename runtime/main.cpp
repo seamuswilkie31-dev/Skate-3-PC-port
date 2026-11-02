@@ -18,6 +18,7 @@
 #include "gpu/gpu.h"
 #include "input/input.h"
 #include "kernel/kernel.h"
+#include "kernel/xam.h"
 #include "loader.h"
 #include "memory.h"
 #include "render/presenter.h"
@@ -99,6 +100,7 @@ int main(int argc, char** argv) {
     }
     kernel::Log("s3native: loaded %s\n", xexPath.c_str());
     kernel::Log("  title %08X version %u, entry 0x%08X\n", game.xex.titleId, game.xex.version, game.entryPoint);
+    kernel::SetTitleId(game.xex.titleId);
     kernel::Log("  %zu recompiled functions in the indirect-call table\n", game.functionsMapped);
     kernel::Log("  %zu kernel/XAM function imports, %zu imported variables:", game.functionImports, game.variables.size());
     for (const auto& [name, address] : game.variables) {

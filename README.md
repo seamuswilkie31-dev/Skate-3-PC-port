@@ -21,9 +21,11 @@ loading, then the title screen, where with no input it starts the
 attract-mode video. All of it now renders in a Vulkan window: the language
 select, the intros, the title screen with its 3D scene, and the attract video.
 The game's own shaders are translated to SPIR-V, and its draws, textures,
-render targets and resolves run in Vulkan. Pads, keyboard and mouse work:
-Start and A take it past the title screen to the storage device prompt, where
-it stops until saves are done. There's no sound yet. See
+render targets and resolves run in Vulkan. Pads, keyboard and mouse work,
+and so do saves: the game creates its save in
+`%APPDATA%\Skate3Native\saves`, loads it on the next boot, and plays the
+new-player flow (difficulty, camera, intro film, team and skater) into the
+skater editor. The 3D world isn't drawn right yet, and there's no sound. See
 [docs/PHASE3.md](docs/PHASE3.md) for the details and what's next, and
 [docs/PHASE2.md](docs/PHASE2.md) for the recompilation work.
 
@@ -35,7 +37,7 @@ it stops until saves are done. There's no sound yet. See
 | `scripts/recomp.ps1` | ISO → `default.xex` → xexscan → 219 MB of C++, in the work folder |
 | XenonRecomp patches | 39 missing instruction forms, D3D half-float packs, the console's 50 MHz timebase, fixes; Skate 3 has 0 unrecognized instructions and 0 traps |
 | `scripts/test_recomp.ps1` | 110 instruction tests (344 checks) against a Python reference model |
-| Runtime (`s3native.exe`) | Runs the game's start-up natively: guest memory, loader, guest threads on host threads, kernel objects and waits, critical sections, timers, files from the disc, GPU front end (`runtime/gpu`), Vulkan renderer: draws, textures, render targets, resolves and frames (`runtime/render`), input from pads, keyboard and mouse (`runtime/input`), audio clock, silent XMA decoder (`runtime/apu`); 126 kernel functions implemented, logging stubs for the other 160 |
+| Runtime (`s3native.exe`) | Runs the game's start-up natively: guest memory, loader, guest threads on host threads, kernel objects and waits, critical sections, timers, files from the disc, GPU front end (`runtime/gpu`), Vulkan renderer: draws, textures, render targets, resolves and frames (`runtime/render`), input from pads, keyboard and mouse (`runtime/input`), saves as host folders, profile, dialogs and notifications (`runtime/kernel`), audio clock, silent XMA decoder (`runtime/apu`); 152 kernel functions implemented, logging stubs for the other 134 |
 
 ## Requirements
 

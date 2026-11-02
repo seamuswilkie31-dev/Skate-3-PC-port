@@ -103,7 +103,9 @@ launcher; XMA audio decode. *Exit:* menus are navigable with Xbox,
 PlayStation and Switch pads and with keyboard and mouse, with sound, and
 basic flick tricks land with the mouse.
 
-**Phase 5 — Saves, DLC & progression.** Content APIs backed by
+**Phase 5 — Saves, DLC & progression.** *(In progress: saves done; the game
+creates and reloads its save and plays the new-player flow into the skater
+editor. See [PHASE5.md](PHASE5.md).)* Content APIs backed by
 `%APPDATA%/Skate3Native/saves`, import of your 360 save, import of the DLC
 packages you own (mounted as installed content), unlock-all option.
 *Exit:* your imported skater loads; a new save round-trips; imported DLC
