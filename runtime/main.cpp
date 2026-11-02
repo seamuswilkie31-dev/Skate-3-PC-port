@@ -3,19 +3,20 @@
 //   s3native [--game <iso or folder>] [--xex <default.xex>] [--log <file>]
 //            [--stall <seconds>] [--time-limit <seconds>] [--watch <hex address>]
 //            [--watch-reads <hex address>] [--no-window] [--dump-frames <interval>]
-//            [--capture-frame <frame>]
+//            [--capture-frame <frame>] [--press <button:seconds,...>]
 //
 // Loads the game, mounts its disc (--game, or the launcher's choice in config.ini),
 // opens the game window, starts the entry point on a guest main thread, and logs every
 // kernel call. Guest threads run on host threads; imports we haven't implemented are
 // logged stubs returning 0. The run ends through kernel::Finish, which prints a report.
 // --dump-frames n writes every nth frame to <work>\frames as a BMP; --capture-frame n logs every
-// clear, resolve and draw of frame n.
+// clear, resolve and draw of frame n; --press presses pad buttons on a schedule (input.h).
 
 #include "apu/xma.h"
 #include "config.h"
 #include "disc.h"
 #include "gpu/gpu.h"
+#include "input/input.h"
 #include "kernel/kernel.h"
 #include "loader.h"
 #include "memory.h"
@@ -43,7 +44,7 @@ std::string DefaultWorkPath(const char* leaf) {
 int main(int argc, char** argv) {
     std::string xexPath = DefaultWorkPath("game\\default.xex");
     std::string logPath = DefaultWorkPath("s3native.log");
-    std::string gameSource;
+    std::string gameSource, presses;
     bool window = true;
     kernel::Options options;
     for (int i = 1; i < argc; i += 2) {
@@ -59,6 +60,7 @@ int main(int argc, char** argv) {
         else if (key == "--log") logPath = argv[i + 1];
         else if (key == "--stall") options.stallSeconds = uint32_t(std::atoi(argv[i + 1]));
         else if (key == "--time-limit") options.timeLimitSeconds = uint32_t(std::atoi(argv[i + 1]));
+        else if (key == "--press") presses = argv[i + 1];
         else if (key == "--capture-frame") render::CaptureFrame(std::strtoull(argv[i + 1], nullptr, 10));
         else if (key == "--dump-frames") render::DumpFrames(uint32_t(std::atoi(argv[i + 1])), DefaultWorkPath("frames"));
         else if (key == "--watch") options.watchAddress = uint32_t(std::strtoul(argv[i + 1], nullptr, 16));
@@ -105,11 +107,10 @@ int main(int argc, char** argv) {
     }
     kernel::Log("\n");
 
-    // The disc: --game, or the ISO/folder chosen in the launcher.
-    if (gameSource.empty()) {
-        Config config;
-        if (LoadConfig(ConfigPath(), config)) gameSource = config.game.source;
-    }
+    // The launcher's settings; the disc is --game, or the ISO/folder chosen there.
+    Config config;
+    LoadConfig(ConfigPath(), config);
+    if (gameSource.empty()) gameSource = config.game.source;
     if (gameSource.empty()) {
         kernel::Log("s3native: no game disc; choose your ISO in the launcher or pass --game <iso or folder>\n");
         return 1;
@@ -145,6 +146,11 @@ int main(int argc, char** argv) {
     // title starts and its loop runs here.
     if (window && !render::Init(error)) {
         kernel::Log("s3native: can't open the game window: %s\n", error.c_str());
+        return 1;
+    }
+    if (window) input::Init(config.input);
+    if (!presses.empty() && !input::ScriptPresses(presses, error)) {
+        kernel::Log("s3native: %s\n", error.c_str());
         return 1;
     }
 

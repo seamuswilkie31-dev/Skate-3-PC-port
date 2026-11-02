@@ -21,8 +21,9 @@ loading, then the title screen, where with no input it starts the
 attract-mode video. All of it now renders in a Vulkan window: the language
 select, the intros, the title screen with its 3D scene, and the attract video.
 The game's own shaders are translated to SPIR-V, and its draws, textures,
-render targets and resolves run in Vulkan. There's no input yet (the title
-screen waits for Start) and no sound. See
+render targets and resolves run in Vulkan. Pads, keyboard and mouse work:
+Start and A take it past the title screen to the storage device prompt, where
+it stops until saves are done. There's no sound yet. See
 [docs/PHASE3.md](docs/PHASE3.md) for the details and what's next, and
 [docs/PHASE2.md](docs/PHASE2.md) for the recompilation work.
 
@@ -34,7 +35,7 @@ screen waits for Start) and no sound. See
 | `scripts/recomp.ps1` | ISO → `default.xex` → xexscan → 219 MB of C++, in the work folder |
 | XenonRecomp patches | 39 missing instruction forms, D3D half-float packs, the console's 50 MHz timebase, fixes; Skate 3 has 0 unrecognized instructions and 0 traps |
 | `scripts/test_recomp.ps1` | 110 instruction tests (344 checks) against a Python reference model |
-| Runtime (`s3native.exe`) | Runs the game's start-up natively: guest memory, loader, guest threads on host threads, kernel objects and waits, critical sections, timers, files from the disc, GPU front end (`runtime/gpu`), Vulkan renderer: draws, textures, render targets, resolves and frames (`runtime/render`), audio clock, silent XMA decoder (`runtime/apu`); 117 kernel functions implemented, logging stubs for the other 169 |
+| Runtime (`s3native.exe`) | Runs the game's start-up natively: guest memory, loader, guest threads on host threads, kernel objects and waits, critical sections, timers, files from the disc, GPU front end (`runtime/gpu`), Vulkan renderer: draws, textures, render targets, resolves and frames (`runtime/render`), input from pads, keyboard and mouse (`runtime/input`), audio clock, silent XMA decoder (`runtime/apu`); 126 kernel functions implemented, logging stubs for the other 160 |
 
 ## Requirements
 
@@ -75,6 +76,14 @@ powershell -ExecutionPolicy Bypass -File scripts\build.ps1
    `--watch-reads <hex address>` for reads too, `--dump-frames <n>` to save
    every nth frame to `%LOCALAPPDATA%\Skate3Native\frames` as a BMP, and
    `--capture-frame <n>` to log every clear, resolve and draw of frame n.
+   `--press <button:seconds,...>` presses pad buttons on a schedule (for
+   example `--press start:40,a:50`).
+
+Controls: any SDL3 pad (Xbox, PlayStation, Switch), or keyboard and mouse:
+WASD for the left stick, mouse movement for the right stick (flick-it),
+Space/E/Q/F for A/B/X/Y, Enter for Start, Tab for Back, Z/C for the bumpers,
+the mouse buttons for the triggers, the arrows for the D-pad. Click the window
+to capture the mouse; Escape frees it. See [docs/PHASE4.md](docs/PHASE4.md).
 
 The launcher builds without any game files: `build.ps1 -Target s3launcher`.
 Settings live in `%APPDATA%\Skate3Native\config.ini`, saves in

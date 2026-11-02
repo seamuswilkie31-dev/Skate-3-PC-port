@@ -32,7 +32,8 @@ add_custom_command(OUTPUT "${S3N_IMPORT_STUBS}"
 
 find_package(Vulkan REQUIRED)
 file(GLOB S3N_DEVICE_SOURCES CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/gpu/*.cpp" "${CMAKE_CURRENT_SOURCE_DIR}/apu/*.cpp"
-    "${CMAKE_CURRENT_SOURCE_DIR}/render/*.cpp" "${CMAKE_CURRENT_SOURCE_DIR}/hooks/*.cpp")
+    "${CMAKE_CURRENT_SOURCE_DIR}/render/*.cpp" "${CMAKE_CURRENT_SOURCE_DIR}/hooks/*.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/input/*.cpp")
 add_executable(s3native main.cpp memory.cpp loader.cpp disc.cpp ${S3N_KERNEL_SOURCES} ${S3N_DEVICE_SOURCES}
     "${S3N_IMPORT_STUBS}")
 target_include_directories(s3native PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")

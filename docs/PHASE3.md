@@ -574,9 +574,9 @@ and textures. That's how the clear problem showed up.
 
 ## Next
 
-1. **Input** (phase 4): pads through SDL3 (`XamInputGetState`), and keyboard
-   and mouse mapped onto the same virtual pad (see the roadmap). The title
-   screen is waiting for Start.
+1. **Input** (phase 4): done, see [PHASE4.md](PHASE4.md). Start and A now get
+   the game past the title screen and its autosave notice, to the storage
+   device prompt.
 2. **Rendering, continued:** the items above, and whatever the game draws
    past the title screen (in game, the 3D world).
 3. **Audio output** (phase 4): real XMA decoding behind the same context

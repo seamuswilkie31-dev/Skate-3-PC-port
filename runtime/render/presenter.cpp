@@ -1,5 +1,6 @@
 #include "render/presenter.h"
 
+#include "input/input.h"
 #include "kernel/kernel.h"
 #include "render/shader_cache.h"
 #include "render/vulkan.h"
@@ -433,7 +434,9 @@ void Run() {
         while (SDL_PollEvent(&event)) {
             if (event.type == SDL_EVENT_QUIT || event.type == SDL_EVENT_WINDOW_CLOSE_REQUESTED) return;
             if (event.type == SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED) RecreateSwapchain();
+            input::HandleEvent(event);
         }
+        input::Poll();
         bool finished;
         {
             std::unique_lock lock(gSwapMutex);
