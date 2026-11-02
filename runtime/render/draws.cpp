@@ -154,6 +154,7 @@ constexpr const char* kPhaseNames[kPhaseCount] = {"indices", "textures", "upload
 std::array<std::atomic<uint64_t>, kPhaseCount> gPhaseNanoseconds{};
 std::atomic<uint64_t> gVerticesConverted{0};
 std::atomic<uint64_t> gVertexHits{0}, gVertexMisses{0};  // the vertex cache's
+std::atomic<uint64_t> gIndexHits{0}, gIndexMisses{0};    // and the index cache's
 
 // Adds the time since the last lap to a phase.
 struct Laps {
@@ -183,7 +184,7 @@ std::string Describe() {
         out += line;
     }
     return out + " (" + std::to_string(gVerticesConverted.load()) + " vertices converted; vertex cache " +
-           std::to_string(gVertexHits.load()) + " hits, " + std::to_string(gVertexMisses.load()) + " misses; vertex pool " + std::to_string(PoolUsed() >> 20) + " MB in use)\n";
+           std::to_string(gVertexHits.load()) + " hits, " + std::to_string(gVertexMisses.load()) + " misses; index cache " + std::to_string(gIndexHits.load()) + " hits, " + std::to_string(gIndexMisses.load()) + " misses; pool " + std::to_string(PoolUsed() >> 20) + " MB in use)\n";
 }
 
 float RegisterFloat(uint32_t index) {
@@ -510,17 +511,22 @@ constexpr VkDeviceSize kPoolSize = 768ull << 20;
 constexpr VkDeviceSize kNotInPool = ~VkDeviceSize(0);
 constexpr uint64_t kPoolReuseFrames = 8;  // frames a returned region waits: none still draws from it
 
-struct VertexEntry {
+// Data kept in the pool: where it is, or, until its copy there is recorded, where it was
+// written in this recording's upload space.
+struct Pooled {
+    bool valid = false;  // made from the memory as it is now
+    VkDeviceSize poolOffset = kNotInPool, poolSize = 0;
+    uint64_t pendingRecording = ~0ull;  // its copy to the pool is still to be recorded
+    VkBuffer ringBuffer = VK_NULL_HANDLE;
+    VkDeviceSize ringOffset = 0;
+    std::vector<uint8_t> data;  // only when the pool had no room
+};
+
+struct VertexEntry : Pooled {
     std::vector<Fetch> fetches;  // as bound: with first and count, the key
     uint32_t first = 0, count = 0;
     uint64_t sourceHash = 0, sampledHash = 0;  // of all the memory it came from, and of a sample
     uint64_t checkedFrame = ~0ull, usedFrame = 0;
-    bool valid = false;                        // converted from the memory as it is now
-    VkDeviceSize poolOffset = kNotInPool, poolSize = 0;
-    uint64_t pendingRecording = ~0ull;         // its copy to the pool is still to be recorded
-    VkBuffer ringBuffer = VK_NULL_HANDLE;      // until then, where it was converted to
-    VkDeviceSize ringOffset = 0;
-    std::vector<uint8_t> data;                 // only when the pool had no room
 };
 std::unordered_map<uint64_t, VertexEntry> gVertexCache;
 uint64_t gVertexCacheSwept = 0;
@@ -540,7 +546,7 @@ struct VertexPool {
     struct Copy {
         VkBuffer from;
         VkDeviceSize fromOffset, toOffset, size;
-        VertexEntry* entry;  // map nodes stay put; an entry with a copy pending was used this frame
+        Pooled* entry;  // map nodes stay put; an entry with a copy pending was used this frame
     };
     std::vector<Copy> pending;  // this recording's copies into the pool
     VkDeviceSize used = 0;
@@ -564,7 +570,7 @@ void PoolFree(VkDeviceSize offset, VkDeviceSize size) {
     gPool.used -= size;
 }
 
-void PoolReturn(VertexEntry& entry) {
+void PoolReturn(Pooled& entry) {
     if (entry.poolOffset == kNotInPool) return;
     gPool.returned.push_back({FrameNumber(), entry.poolOffset, entry.poolSize});
     entry.poolOffset = kNotInPool;
@@ -579,7 +585,7 @@ VkDeviceSize PoolAllocate(VkDeviceSize size) {
         Vulkan& vk = Vk();
         VkBufferCreateInfo info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
         info.size = kPoolSize;
-        info.usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+        info.usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
         VkMemoryRequirements requirements{};
         VkMemoryAllocateInfo alloc{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
         alloc.memoryTypeIndex = UINT32_MAX;
@@ -728,11 +734,29 @@ VertexEntry& FindVertices(const std::vector<Fetch>& fetches, uint32_t first, uin
 
 // Where the entry's vertices already are on the GPU: in the pool, or converted earlier in
 // this recording and not yet copied there. A null buffer if neither.
-std::pair<VkBuffer, VkDeviceSize> Resident(const VertexEntry& entry) {
+std::pair<VkBuffer, VkDeviceSize> Resident(const Pooled& entry) {
     if (!entry.valid) return {VK_NULL_HANDLE, 0};
     if (entry.pendingRecording == RecordingNumber()) return {entry.ringBuffer, entry.ringOffset};
     if (entry.poolOffset != kNotInPool && entry.pendingRecording == ~0ull) return {gPool.buffer, entry.poolOffset};
     return {VK_NULL_HANDLE, 0};
+}
+
+// `entry`'s new contents, just written to upload space (`out`, at `ringOffset` in `ring`): kept in
+// the pool, its copy there put off until the rendering scope ends.
+void Pool(Pooled& entry, const uint8_t* out, size_t size, VkBuffer ring, VkDeviceSize ringOffset) {
+    entry.valid = true;
+    PoolReturn(entry);
+    entry.poolOffset = PoolAllocate(size);
+    if (entry.poolOffset == kNotInPool) {
+        entry.data.assign(out, out + size);  // no room: copied for every draw instead
+        return;
+    }
+    entry.data.clear();
+    entry.poolSize = (size + 255) & ~size_t(255);
+    gPool.pending.push_back({ring, ringOffset, entry.poolOffset, size, &entry});
+    entry.pendingRecording = RecordingNumber();
+    entry.ringBuffer = ring;
+    entry.ringOffset = ringOffset;
 }
 
 // Fills `out` (upload space at `ringOffset` in `ring`) with the entry's vertices, converting
@@ -743,23 +767,65 @@ void FillVertices(VertexEntry& entry, uint8_t* out, VkBuffer ring, VkDeviceSize 
         ++gVertexMisses;
         ConvertVertices(entry.fetches, entry.first, entry.count, out);
         gVerticesConverted += entry.count;
-        entry.valid = true;
-        PoolReturn(entry);
-        entry.poolOffset = PoolAllocate(size);
-        if (entry.poolOffset == kNotInPool) {
-            entry.data.assign(out, out + size);  // no room: copied for every draw instead
-        } else {
-            entry.poolSize = (size + 255) & ~size_t(255);
-            gPool.pending.push_back({ring, ringOffset, entry.poolOffset, size, &entry});
-            entry.pendingRecording = RecordingNumber();
-            entry.ringBuffer = ring;
-            entry.ringOffset = ringOffset;
-        }
+        Pool(entry, out, size, ring, ringOffset);
         return;
     }
     ++gVertexHits;
     if (!entry.data.empty()) std::memcpy(out, entry.data.data(), size);
     else ConvertVertices(entry.fetches, entry.first, entry.count, out);  // a lost pool copy: convert again
+}
+// Rebased indices, kept like vertices: a draw's index buffer is usually as static as its
+// vertices. Checked against their memory once a frame.
+constexpr uint32_t kCachedIndices = 64;  // the fewest indices a draw needs to be cached
+
+struct IndexKey {
+    uint32_t base, count, offset, reset;
+    uint32_t flags;  // 32-bit (bit 0), endian swap (1-2), primitive restart (3), quads (4)
+    bool operator==(const IndexKey&) const = default;
+};
+
+struct IndexEntry : Pooled {
+    IndexKey key{};
+    uint64_t sourceHash = 0, checkedFrame = ~0ull, usedFrame = 0;
+    uint32_t first = 0, last = 0, size = 0;  // the vertices used, and the indices drawn
+};
+std::unordered_map<uint64_t, IndexEntry> gIndexCache;
+uint64_t gIndexCacheSwept = 0;
+
+// The cache entry for a draw's indices, `source` being their memory; `valid` false when it
+// has to be made again.
+IndexEntry& FindIndices(const IndexKey& key, const uint8_t* source, size_t bytes) {
+    uint64_t frame = FrameNumber();
+    if (frame >= gIndexCacheSwept + kCacheFrames / 2) {
+        gIndexCacheSwept = frame;
+        std::erase_if(gIndexCache, [frame](auto& item) {
+            if (item.second.usedFrame + kCacheFrames >= frame) return false;
+            PoolReturn(item.second);
+            return true;
+        });
+    }
+    IndexEntry& entry = gIndexCache[HashMemory(reinterpret_cast<const uint8_t*>(&key), sizeof key)];
+    if (!(entry.key == key)) {
+        PoolReturn(entry);
+        entry.key = key;
+        entry.valid = false;
+        entry.data.clear();
+        entry.checkedFrame = ~0ull;
+    }
+    if (entry.checkedFrame != frame) {
+        entry.checkedFrame = frame;
+        uint64_t hash = HashMemory(source, bytes);
+        if (hash != entry.sourceHash) {
+            PoolReturn(entry);
+            entry.sourceHash = hash;
+            entry.valid = false;
+            entry.data.clear();
+        }
+    }
+    // Neither on the GPU nor kept here (a copy that was never recorded): made again.
+    if (entry.valid && !Resident(entry).first && entry.data.empty()) entry.valid = false;
+    entry.usedFrame = frame;
+    return entry;
 }
 // An index buffer's indices: endian-swapped dwords, low half first for 16-bit ones.
 template <uint32_t kEndian, bool kWide>
@@ -978,37 +1044,50 @@ void Draw(const DrawCall& call) {
     indices.clear();
     uint32_t first = indexOffset, last = indexOffset + count - 1;
     bool indexed = source == 0 || primitive == 13;
+    IndexEntry* cachedIndices = nullptr;  // large index buffers: kept, rebased, in the pool
     if (source == 0) {
         bool wide = call.initiator >> 11 & 1;
         uint32_t endian = call.indexSize >> 30, available = call.indexSize & 0xFFFFFF;
         count = std::min(count, available);
         uint32_t resetIndex = Register(reg::kVgtMultiPrimIbResetIndx) & (wide ? 0xFFFFFFFF : 0xFFFF);
-        indices.resize(count);
-        uint32_t* p = indices.data();
-        ReadIndices(gpu::PhysicalMemory(call.indexBase & (wide ? ~3u : ~1u)), count, wide, endian, p);
-        if (restart) {
-            first = UINT32_MAX, last = 0;
-            for (uint32_t i = 0; i < count; ++i) {
-                if (p[i] == resetIndex) {
-                    p[i] = UINT32_MAX;
-                    continue;
-                }
-                p[i] += indexOffset;
-                first = std::min(first, p[i]), last = std::max(last, p[i]);
-            }
-            if (first > last) return;  // nothing but restarts
-            for (uint32_t i = 0; i < count; ++i)
-                if (p[i] != UINT32_MAX) p[i] -= first;
+        const uint8_t* data = gpu::PhysicalMemory(call.indexBase & (wide ? ~3u : ~1u));
+        if (count >= kCachedIndices) {
+            IndexKey key{call.indexBase, count, indexOffset, restart ? resetIndex : 0,
+                         uint32_t(wide) | endian << 1 | uint32_t(restart) << 3 | uint32_t(primitive == 13) << 4};
+            cachedIndices = &FindIndices(key, data, size_t(count) * (wide ? 4 : 2));
+        }
+        if (cachedIndices && cachedIndices->valid) {
+            first = cachedIndices->first, last = cachedIndices->last;
         } else {
-            uint32_t low = UINT32_MAX, high = 0;
-            for (uint32_t i = 0; i < count; ++i) low = std::min(low, p[i]), high = std::max(high, p[i]);
-            if (low > high) return;  // no indices
-            for (uint32_t i = 0; i < count; ++i) p[i] -= low;
-            first = low + indexOffset, last = high + indexOffset;
-        }    } else if (primitive == 13) {
+            indices.resize(count);
+            uint32_t* p = indices.data();
+            ReadIndices(data, count, wide, endian, p);
+            if (restart) {
+                first = UINT32_MAX, last = 0;
+                for (uint32_t i = 0; i < count; ++i) {
+                    if (p[i] == resetIndex) {
+                        p[i] = UINT32_MAX;
+                        continue;
+                    }
+                    p[i] += indexOffset;
+                    first = std::min(first, p[i]), last = std::max(last, p[i]);
+                }
+                if (first > last) return;  // nothing but restarts
+                for (uint32_t i = 0; i < count; ++i)
+                    if (p[i] != UINT32_MAX) p[i] -= first;
+            } else {
+                uint32_t low = UINT32_MAX, high = 0;
+                for (uint32_t i = 0; i < count; ++i) low = std::min(low, p[i]), high = std::max(high, p[i]);
+                if (low > high) return;  // no indices
+                for (uint32_t i = 0; i < count; ++i) p[i] -= low;
+                first = low + indexOffset, last = high + indexOffset;
+            }
+        }
+    } else if (primitive == 13) {
         for (uint32_t i = 0; i < count; ++i) indices.push_back(i);
     }
-    if (primitive == 13) {  // quads (a, b, c, d) as triangles (a, b, c) and (a, c, d)
+    bool indicesKept = cachedIndices && cachedIndices->valid;
+    if (primitive == 13 && !indicesKept) {  // quads (a, b, c, d) as triangles (a, b, c) and (a, c, d)
         static thread_local std::vector<uint32_t> quads;
         quads.swap(indices);
         indices.clear();
@@ -1016,6 +1095,8 @@ void Draw(const DrawCall& call) {
             for (size_t i : {0, 1, 2, 0, 2, 3}) indices.push_back(quads[q + i]);
         if (indices.empty()) return;
     }
+    uint32_t indexCount = indicesKept ? cachedIndices->size : uint32_t(indices.size());
+    if (cachedIndices && !indicesKept) cachedIndices->first = first, cachedIndices->last = last, cachedIndices->size = indexCount;
     lap(kPhaseIndices);
     uint32_t vertexCount = last - first + 1;
     if (vertexCount > kMaxVertices) {
@@ -1044,10 +1125,12 @@ void Draw(const DrawCall& call) {
     // the indices.
     VertexEntry* cached = vertexCount >= kCachedVertices ? &FindVertices(fetches, first, vertexCount) : nullptr;
     std::pair<VkBuffer, VkDeviceSize> resident{VK_NULL_HANDLE, 0};  // vertices already on the GPU
+    std::pair<VkBuffer, VkDeviceSize> indicesResident{VK_NULL_HANDLE, 0};
     bool stale[2];
     size_t sharedAt, vertexAt, indexAt, total;
     auto layOut = [&] {
         resident = cached ? Resident(*cached) : std::pair<VkBuffer, VkDeviceSize>{VK_NULL_HANDLE, 0};
+        indicesResident = indicesKept ? Resident(*cachedIndices) : std::pair<VkBuffer, VkDeviceSize>{VK_NULL_HANDLE, 0};
         for (uint32_t stage = 0; stage < 2; ++stage) {
             const UploadedConstants& u = gUploadedConstants[stage];
             stale[stage] = u.recording != RecordingNumber() || u.version != gpu::ConstantsVersion(stage);
@@ -1055,7 +1138,7 @@ void Draw(const DrawCall& call) {
         sharedAt = (size_t(stale[0]) + stale[1]) * kStageConstantsSize;
         vertexAt = Align(sharedAt + kSharedSize);
         indexAt = Align(vertexAt + (resident.first ? 0 : size_t(vertexCount) * vertexStride));
-        total = indexAt + indices.size() * 4;
+        total = indexAt + (indicesResident.first ? 0 : size_t(indexCount) * 4);
     };
     layOut();
     uint64_t recording = RecordingNumber();
@@ -1116,7 +1199,25 @@ void Draw(const DrawCall& call) {
         vertexBuffer = upload.buffer;
         vertexOffset = upload.offset + vertexAt;
     }
-    if (!indices.empty()) std::memcpy(upload.data + indexAt, indices.data(), indices.size() * 4);
+    VkBuffer indexBuffer = indicesResident.first;
+    VkDeviceSize indexBufferOffset = indicesResident.second;
+    if (indexed && indexBuffer) {
+        ++gIndexHits;
+    } else if (indexed) {
+        uint8_t* out = upload.data + indexAt;
+        if (indicesKept) {  // kept here: the pool had no room
+            std::memcpy(out, cachedIndices->data.data(), size_t(indexCount) * 4);
+            ++gIndexHits;
+        } else {
+            std::memcpy(out, indices.data(), size_t(indexCount) * 4);
+            if (cachedIndices) {
+                Pool(*cachedIndices, out, size_t(indexCount) * 4, upload.buffer, upload.offset + indexAt);
+                ++gIndexMisses;
+            }
+        }
+        indexBuffer = upload.buffer;
+        indexBufferOffset = upload.offset + indexAt;
+    }
     lap(kPhaseVertices);
 
     // The render targets.
@@ -1259,8 +1360,8 @@ void Draw(const DrawCall& call) {
     }
     if (!fetches.empty()) vkCmdBindVertexBuffers(cb, 0, 1, &vertexBuffer, &vertexOffset);
     if (indexed) {
-        vkCmdBindIndexBuffer(cb, upload.buffer, upload.offset + indexAt, VK_INDEX_TYPE_UINT32);
-        vkCmdDrawIndexed(cb, uint32_t(indices.size()), 1, 0, 0, 0);
+        vkCmdBindIndexBuffer(cb, indexBuffer, indexBufferOffset, VK_INDEX_TYPE_UINT32);
+        vkCmdDrawIndexed(cb, indexCount, 1, 0, 0, 0);
     } else {
         vkCmdDraw(cb, count, 1, 0, 0);
     }

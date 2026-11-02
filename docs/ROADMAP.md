@@ -116,7 +116,7 @@ full playthrough. Locate the frame limiter and every frame-time-dependent
 system; 60 fps first, then 120/240. Resolution, aspect ratio, VSync. *(Begun:
 the game paces itself by vertical blanks and times itself by the clock, so
 the launcher's cap and VSync work; see [PHASE3.md](PHASE3.md). The world runs
-at about 56 fps at the 60 cap.)*
+at about 58 fps at the 60 cap.)*
 Modifiers wired to the physics constants. *Exit:* career mode completable at
 60 fps without timing bugs.
 

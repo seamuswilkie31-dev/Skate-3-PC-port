@@ -845,6 +845,19 @@ the GPU keeps up.
 textures, cache lookups, vertices and recording. The rest needs deeper
 changes, such as caching index buffers the same way.
 
+**The index cache.** Index buffers are as static as their vertices, so
+indexed draws of 64 indices or more keep their rebased indices in the same
+pool. They're keyed by address, count, offset, size, endian swap, restart
+index and quads, and checked against their memory once a frame. Vertex and
+index entries share the pool's bookkeeping (`Pooled`). In a run: 10.3
+million hits and 1,290 misses, and index time fell from 7.5 s to 2.8 s.
+
+**Result:** about **58 fps in Port Carverton**. The command processor now
+spends more time waiting for the vertical blank than it did, and the game's
+render thread is still mostly waiting on GPU fences. Each frame's work (about
+10–12 ms) starts after the previous flip, so only the heavier frames, those
+past 16.7 ms, slip to the next pair of vblanks. No validation errors.
+
 ## Next
 
 1. **Input** (phase 4): done, see [PHASE4.md](PHASE4.md). Start and A now get
