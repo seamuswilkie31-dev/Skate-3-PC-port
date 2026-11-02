@@ -1,0 +1,42 @@
+diff --git a/XenosRecomp/main.cpp b/XenosRecomp/main.cpp
+index d015145..d547180 100644
+--- a/XenosRecomp/main.cpp
++++ b/XenosRecomp/main.cpp
+@@ -134,7 +134,13 @@ int main(int argc, char** argv)
+ #endif
+ 
+                 IDxcBlob* spirv = dxcCompiler.compile(recompiler.out, recompiler.isPixelShader, false, true);
+-                assert(spirv != nullptr);
++                if (spirv == nullptr)
++                {
++                    // Skate 3 Native: leave a shader that doesn't compile out of the cache
++                    // instead of stopping the whole run.
++                    fmt::println("Skipping shader {:016X}: DXC couldn't compile it", hashShaderPair.first);
++                    return;
++                }
+ 
+                 bool result = smolv::Encode(spirv->GetBufferPointer(), spirv->GetBufferSize(), shader.spirv, smolv::kEncodeFlagStripDebugInfo);
+                 assert(result);
+@@ -155,8 +161,12 @@ int main(int argc, char** argv)
+         std::vector<uint8_t> dxil;
+         std::vector<uint8_t> spirv;
+ 
++        size_t entryCount = 0;
+         for (auto& [hash, shader] : shaders)
+         {
++            if (shader.spirv.empty())
++                continue;
++            ++entryCount;
+             f.println("\t{{ 0x{:X}, {}, {}, {}, {}, {} }},",
+                 hash, dxil.size(), (shader.dxil != nullptr) ? shader.dxil->GetBufferSize() : 0, spirv.size(), shader.spirv.size(), shader.specConstantsMask);
+ 
+@@ -203,7 +213,8 @@ int main(int argc, char** argv)
+ 
+         f.println("const size_t g_spirvCacheCompressedSize = {};", spirvCompressed.size());
+         f.println("const size_t g_spirvCacheDecompressedSize = {};", spirv.size());
+-        f.println("const size_t g_shaderCacheEntryCount = {};", shaders.size());
++        f.println("const size_t g_shaderCacheEntryCount = {};", entryCount);
++        fmt::println("{} of {} shaders in the cache", entryCount, shaders.size());
+ 
+         writeAllBytes(output, f.out.data(), f.out.size());
+     }

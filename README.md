@@ -18,8 +18,9 @@ with real waits, events, mutexes, critical sections and timers. It reads its
 data from your ISO, drives an emulated GPU front end, and has an audio clock
 and a silent XMA decoder. Its whole boot sequence now runs: the EA intro,
 loading, then the title screen, where with no input it starts the
-attract-mode video. That's about 34 frames a second presented, but none of
-it is drawn yet, and there's no sound or input. See
+attract-mode video. Every frame is presented in a Vulkan window, and 391 of
+the game's 392 shaders already translate to SPIR-V, but nothing is drawn yet
+(the window stays black), and there's no sound or input. See
 [docs/PHASE3.md](docs/PHASE3.md) for the details and what's next, and
 [docs/PHASE2.md](docs/PHASE2.md) for the recompilation work.
 
@@ -35,9 +36,10 @@ it is drawn yet, and there's no sound or input. See
 
 ## Requirements
 
-Windows 10/11 x64, Visual Studio 2022 Build Tools with the C++ workload and
-the "C++ Clang tools for Windows" component, Python 3, Git. CMake fetches SDL3
-and Dear ImGui on first configure; `setup_tools.ps1` fetches XenonRecomp.
+Windows 10 (1803 or later) or 11, x64, a Vulkan GPU, Visual Studio 2022
+Build Tools with the C++ workload and the "C++ Clang tools for Windows"
+component, the Vulkan SDK, Python 3, Git. CMake fetches SDL3 and Dear ImGui on
+first configure; `setup_tools.ps1` fetches XenonRecomp and XenosRecomp.
 
 ## From your ISO to a running game
 
@@ -46,24 +48,29 @@ powershell -ExecutionPolicy Bypass -File scripts\setup_tools.ps1
 powershell -ExecutionPolicy Bypass -File scripts\test_recomp.ps1
 powershell -ExecutionPolicy Bypass -File scripts\build.ps1 -Target xexscan
 powershell -ExecutionPolicy Bypass -File scripts\recomp.ps1 -Iso "D:\Games\Skate 3.iso"
+powershell -ExecutionPolicy Bypass -File scripts\shaders.ps1 -Iso "D:\Games\Skate 3.iso"
 powershell -ExecutionPolicy Bypass -File scripts\build.ps1
 %LOCALAPPDATA%\Skate3Native\build\bin\s3native.exe
 ```
 
-1. `setup_tools.ps1` builds XenonRecomp at the pinned commit with our patches
-   from `recomp/xenonrecomp-patches/` (change XenonRecomp by editing those).
-2. `test_recomp.ps1` runs the instruction tests for those patches.
+1. `setup_tools.ps1` builds XenonRecomp and XenosRecomp at their pinned
+   commits with our patches from `recomp/xenonrecomp-patches/` and
+   `recomp/xenosrecomp-patches/` (change the tools by editing those).
+2. `test_recomp.ps1` runs the instruction tests for the XenonRecomp patches.
 3. `recomp.ps1` turns your copy's `default.xex` into C++ in
    `%LOCALAPPDATA%\Skate3Native\recomp\out` (game-derived, never committed).
-4. `build.ps1` builds everything with Ninja + clang-cl into
+4. `shaders.ps1` translates the game's shaders to SPIR-V in
+   `%LOCALAPPDATA%\Skate3Native\shaders` (game-derived too).
+5. `build.ps1` builds everything with Ninja + clang-cl into
    `%LOCALAPPDATA%\Skate3Native\build` (the generated code compiles in a few
    minutes on 8 parallel jobs; Visual Studio's generator works but is serial).
-5. `s3native.exe` runs the game and logs every kernel call to the console and
-   `%LOCALAPPDATA%\Skate3Native\s3native.log`. It reads game files from the
-   ISO or folder chosen in the launcher, or from `--game <path>`. Other
-   options: `--xex <path>`, `--log <file>`, `--stall <seconds>`,
-   `--time-limit <seconds>`, `--watch <hex address>` to log every write to
-   one guest word, and `--watch-reads <hex address>` for reads too.
+6. `s3native.exe` opens the game window and runs the game, logging every
+   kernel call to the console and `%LOCALAPPDATA%\Skate3Native\s3native.log`.
+   It reads game files from the ISO or folder chosen in the launcher, or
+   from `--game <path>`. Other options: `--no-window`, `--xex <path>`,
+   `--log <file>`, `--stall <seconds>`, `--time-limit <seconds>`,
+   `--watch <hex address>` to log every write to one guest word, and
+   `--watch-reads <hex address>` for reads too.
 
 The launcher builds without any game files: `build.ps1 -Target s3launcher`.
 Settings live in `%APPDATA%\Skate3Native\config.ini`, saves in

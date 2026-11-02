@@ -26,6 +26,11 @@ cmd /c "`"$vs\VC\Auxiliary\Build\vcvars64.bat`" >nul && set" | ForEach-Object {
 }
 $llvm = "$vs\VC\Tools\Llvm\x64\bin"
 
+# The runtime renders with Vulkan. A shell opened before the SDK was installed doesn't
+# have its variable yet, so take it from the machine settings.
+if (-not $env:VULKAN_SDK) { $env:VULKAN_SDK = [Environment]::GetEnvironmentVariable('VULKAN_SDK', 'Machine') }
+if (-not $env:VULKAN_SDK) { throw 'The Vulkan SDK is required (https://vulkan.lunarg.com).' }
+
 if (-not (Test-Path (Join-Path $BuildDir 'CMakeCache.txt'))) {
     cmake -S $repo -B $BuildDir -G Ninja "-DCMAKE_BUILD_TYPE=$Config" `
         "-DCMAKE_C_COMPILER=$llvm\clang-cl.exe" "-DCMAKE_CXX_COMPILER=$llvm\clang-cl.exe" "-DCMAKE_LINKER=$llvm\lld-link.exe"

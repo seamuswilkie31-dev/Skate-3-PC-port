@@ -6,6 +6,7 @@
 #include "gpu/gpu.h"
 #include "kernel/kernel.h"
 #include "memory.h"
+#include "render/presenter.h"
 
 #include <cstring>
 
@@ -147,6 +148,7 @@ PPC_FUNC(__imp__VdSwap) {
     std::memset(base + ringSpace, 0, 64 * 4);
     StoreBE32(base, ringSpace, 0xC0000000 | (62u << 16) | (0x10u << 8));  // type 3 NOP, 63 dwords of payload
     gpu::CountSwap();
+    render::NotifySwap();
 }
 
 // u32 VdInitializeScalerCommandBuffer(u32 sourceXY, u32 sourceWH, u32 outputXY, u32 outputWH,

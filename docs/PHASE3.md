@@ -329,12 +329,46 @@ So boot reaches the "press Start" screen and waits for a button no one can
 press yet. It also probes the cache partition (`CACHE:\httpcache`), which
 isn't served, and carries on without it.
 
+## Rendering, step 1: the window, Vulkan and the shaders
+
+**The window** (`runtime/render/presenter.cpp`) opens on the process's main
+thread with SDL3 and drives a Vulkan swapchain (vsync). Every `VdSwap`
+presents a frame; until draws are translated it's cleared to black. The
+title bar shows the game's frame rate, closing the window ends the run, and
+`--no-window` runs without one. On this machine it picked the RTX 5060 Ti and
+presented one frame for every game swap (1,792 in 45 seconds).
+
+**The shaders.** `data\big\shaders_final.big` holds all of the game's
+shaders: 392 standard Xbox 360 shader containers (261 pixel, 131 vertex).
+These are exactly what XenosRecomp reads:
+- XenosRecomp turns each container into HLSL, and DXC compiles that to
+  SPIR-V.
+- **391 of 392 compile.** The one failure samples a 1D texture, which
+  XenosRecomp doesn't support yet. It's skipped for now.
+- `setup_tools.ps1` now builds XenosRecomp too (pinned to `990d03b`, with
+  `recomp/xenosrecomp-patches/0001` making it skip a shader that won't
+  compile instead of crashing).
+- `scripts/shaders.ps1` runs the whole pipeline from your ISO into
+  `<work>\shaders\shader_cache.cpp` (930 KB of compressed SPIR-V, keyed by
+  each container's hash).
+
+**The approach.** These results confirm the roadmap's plan: render at the
+Direct3D level rather than emulating the GPU's packets. XenonRecomp emits
+every game function as a weak symbol, so the runtime can replace any of them
+with its own code, and the game's statically linked Direct3D functions can
+be swapped for Vulkan implementations one by one. Shaders arrive as the same
+containers the cache was built from, so a shader is a hash lookup. The
+packet-level GPU front end stays underneath for everything not yet replaced.
+
 ## Next
 
-1. **Rendering.** Translate the draws the command processor now sees:
-   shaders through XenosRecomp, the Vulkan backend, then `VdSwap` presenting
-   the front buffer in a window. The first frames to aim for are the EA intro
-   and the title screen.
+1. **Rendering, step 2: find Direct3D.** Map the game's Direct3D library:
+   device creation, render targets and depth buffers, shader creation,
+   vertex declarations and buffers, textures and samplers, render states,
+   draws, resolves and present. The command processor's packets help here,
+   because each function leaves a recognisable trace in the ring buffer.
+   Then replace them with Vulkan, starting with what the EA intro and the
+   title screen use.
 2. **Input** (phase 4): pads through SDL3 (`XamInputGetState`), and keyboard
    and mouse mapped onto the same virtual pad (see the roadmap). That's what
    gets past "press Start".

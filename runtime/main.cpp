@@ -2,11 +2,12 @@
 //
 //   s3native [--game <iso or folder>] [--xex <default.xex>] [--log <file>]
 //            [--stall <seconds>] [--time-limit <seconds>] [--watch <hex address>]
+//            [--watch-reads <hex address>] [--no-window]
 //
 // Loads the game, mounts its disc (--game, or the launcher's choice in config.ini),
-// starts its entry point on a guest main thread, and logs every kernel call. Guest
-// threads run on host threads; imports we haven't implemented are logged stubs
-// returning 0. The run ends through kernel::Finish, which prints a report.
+// opens the game window, starts the entry point on a guest main thread, and logs every
+// kernel call. Guest threads run on host threads; imports we haven't implemented are
+// logged stubs returning 0. The run ends through kernel::Finish, which prints a report.
 
 #include "apu/xma.h"
 #include "config.h"
@@ -15,6 +16,7 @@
 #include "kernel/kernel.h"
 #include "loader.h"
 #include "memory.h"
+#include "render/presenter.h"
 
 #include <windows.h>
 
@@ -37,9 +39,16 @@ int main(int argc, char** argv) {
     std::string xexPath = DefaultWorkPath("game\\default.xex");
     std::string logPath = DefaultWorkPath("s3native.log");
     std::string gameSource;
+    bool window = true;
     kernel::Options options;
-    for (int i = 1; i + 1 < argc; i += 2) {
+    for (int i = 1; i < argc; i += 2) {
         std::string key = argv[i];
+        if (key == "--no-window") {
+            window = false;
+            --i;  // a flag without a value
+            continue;
+        }
+        if (i + 1 >= argc) break;
         if (key == "--game") gameSource = argv[i + 1];
         else if (key == "--xex") xexPath = argv[i + 1];
         else if (key == "--log") logPath = argv[i + 1];
@@ -118,6 +127,13 @@ int main(int argc, char** argv) {
     kernel::Log("  TLS: %u static bytes, %u slots; default stack %u KB\n", tls.staticSize, tls.slotCount,
                 game.xex.defaultStackSize / 1024);
 
+    // The window belongs to this (the process's main) thread, so it's opened before the
+    // title starts and its loop runs here.
+    if (window && !render::Init(error)) {
+        kernel::Log("s3native: can't open the game window: %s\n", error.c_str());
+        return 1;
+    }
+
     kernel::ThreadStart start;
     start.entry = game.entryPoint;
     start.stackSize = game.xex.defaultStackSize > 0x100000 ? game.xex.defaultStackSize : 0x100000;
@@ -128,5 +144,9 @@ int main(int argc, char** argv) {
         return 1;
     }
     kernel::DereferenceObject(mainThread);
-    for (;;) Sleep(INFINITE);  // kernel::Finish ends the process
+    if (!window) {
+        for (;;) Sleep(INFINITE);  // kernel::Finish ends the process
+    }
+    render::Run();
+    kernel::Finish("the window was closed", 0);
 }
