@@ -3,8 +3,7 @@
 // The game's draws in Vulkan, on the command processor's thread: a pipeline from the
 // register state and the two translated shaders, vertices and indices converted from
 // guest memory, and the shader constants copied from the GPU's registers, drawn into the
-// render targets (targets.cpp). Textures aren't converted yet: every texture fetch reads
-// white.
+// render targets (targets.cpp), sampling textures through textures.h.
 
 #include <cstdint>
 

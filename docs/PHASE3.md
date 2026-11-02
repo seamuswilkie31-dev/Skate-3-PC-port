@@ -485,20 +485,100 @@ To check the chain, that target was temporarily filled with a test colour,
 and the colour came out unchanged in the dumped frames. The Khronos
 validation layer reports no errors or warnings.
 
+## Rendering, step 3 (third part): draws and textures, and the boot sequence on screen
+
+Every frame of the boot now renders, as it does on the console:
+- the language select;
+- the Skate 3 logo and copyright screen;
+- the EA and Black Box intros;
+- the title screen, with its 3D scene and "Press Start to continue";
+- the attract-mode video.
+
+**What the game draws.** A census of 100,000 draws showed what the draws use:
+- **Viewport:** the viewport transform is always on.
+- **Pixel centres:** Direct3D's convention (centres at integers) throughout.
+- **Primitives:** almost all triangle lists, triangle strips and quad lists,
+  nearly all auto-indexed.
+
+**Draws** (`runtime/render/draws.cpp`), for every draw whose shaders are
+both translated:
+- **Pipelines:** one Vulkan pipeline per shader pair and register state:
+  vertex layout, topology, culling, depth and stencil, blending, colour
+  mask, alpha test.
+- **Vertices:** converted from guest memory through each vertex fetch as
+  Direct3D bound it: format, endian swap, stride and offset. They go in at
+  the input locations XenosRecomp gives each usage. Normals, tangents and
+  blend indices go in as `uint4`, the rest as `float4`.
+- **Indices:** from the index buffer, rebased. Quad lists become pairs of
+  triangles.
+- **Constants:** both stages' constants (vertex c0–255, pixel c256–511) are
+  copied from the registers. The shared constants the shaders read through
+  buffer device addresses come with them: texture and sampler slots,
+  booleans, the half-pixel offset and the alpha-test threshold.
+- **Viewport and scissor:** from the registers, moved by the window offset.
+  XenosRecomp compiles vertex shaders with DXC's `-fvk-invert-y`, so the
+  viewport is built to undo that inversion. Without that, every frame came
+  out upside down.
+- **Batching:** draws, clears and resolves share one rendering scope while
+  their targets stay the same, and one upload ring per recording
+  (`render/backend.h`).
+
+**Textures** (`runtime/render/textures.cpp`) come from the fetch constants,
+in bindless arrays:
+- **Resolved render targets:** a render target a resolve copied out is
+  sampled directly; there were about 32,000 such uses a minute.
+- **From memory:** other textures are converted from guest memory: untiled
+  (the Xbox 360's 2D tiling) or copied row by row, and the endian swap is
+  undone.
+- **Formats:** 8888, 565, 1555, 2_10_10_10, 8, 8_8, 16-bit and float
+  formats, and DXT1/3/5, DXN and DXT5A as BC1–BC5. The fetch constant's
+  swizzle becomes the view's component mapping.
+- **Changes:** each texture is checked once a frame, by a hash of its
+  memory. The movies' three YUV planes are converted again every frame, and
+  the game's own shaders turn them into RGB.
+- **Samplers:** from the fetch constant's clamps, filters and border colour.
+  Only the base level is converted so far.
+
+**Two more fixes on the way:**
+- **Destination swizzle.** Direct3D also rewrites a vertex fetch's
+  destination swizzle when it binds a declaration: components the format
+  lacks become 0 or 1. `ShaderKey` now ignores that too. That matched the
+  last game shader, a textured quad (still 249 keys, still unambiguous).
+- **Fast clears.** Direct3D clears the 1280×720 target through a 640×360
+  4× MSAA view of the same EDRAM, and the same samples. With a separate
+  image per view, the 1280×720 depth buffer was never cleared, and every UI
+  quad failed its depth test. A clear now reaches every render target laid
+  out over the same tiles, in that target's own pixels.
+
+**Diagnostics:** `--capture-frame n` logs every clear, resolve and draw of
+frame n: the shaders, primitive, targets, viewport, scissor, blend state
+and textures. That's how the clear problem showed up.
+
+**Result** (60-second boot):
+
+| | Count |
+|---|---|
+| Draws | 148,449 through 22 pipelines, none skipped |
+| Textures from memory | 49, converted again about 1,800 times as the movies play |
+| Frame rate | about 37 frames a second, every one presented |
+| Validation layer | no errors or warnings |
+
+**Not done yet:**
+- **Textures:** mipmaps, 3D and cube textures, and gamma.
+- **Resolves:** depth resolves, and EDRAM aliasing beyond clears (copies
+  between differently laid-out views).
+- **Direct3D's draws:** the point lists in recorded command buffers, and
+  draws that use rectangle lists or screen-space positions.
+- **Speed:** vertices are converted on the CPU for every draw, and the
+  barriers are coarse.
+
 ## Next
 
-1. **Rendering, step 3 (continued): draws.**
-   - **Pipelines:** built from the register state: vertex input from the
-     bound fetch instructions; blending, depth and culling; viewport and
-     scissor.
-   - **Data:** vertex and index buffers from guest memory (byte-swapped);
-     constants into XenosRecomp's constant buffers; textures (untiled and
-     converted) for its bindless arrays.
-   - **The rest of Direct3D's work:** depth resolves.
-   - **Goal:** the EA intro and the title screen in the window.
-2. **Input** (phase 4): pads through SDL3 (`XamInputGetState`), and keyboard
-   and mouse mapped onto the same virtual pad (see the roadmap). That's what
-   gets past "press Start".
+1. **Input** (phase 4): pads through SDL3 (`XamInputGetState`), and keyboard
+   and mouse mapped onto the same virtual pad (see the roadmap). The title
+   screen is waiting for Start.
+2. **Rendering, continued:** the items above, and whatever the game draws
+   past the title screen (in game, the 3D world).
 3. **Audio output** (phase 4): real XMA decoding behind the same context
    interface, and the render driver's frames played through SDL3.
 4. **Saves and DLC** (phase 5): the hard drive and cache partitions, the

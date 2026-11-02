@@ -38,4 +38,14 @@ struct Upload {
 };
 VkCommandBuffer Allocate(VkDeviceSize size, Upload& upload);
 
+// Frames finished so far (swaps handled).
+uint64_t FrameNumber();
+
+// The texture a resolve last wrote at this physical address, or nullptr. serial changes
+// whenever the image is made again.
+Image* ResolvedImage(uint32_t address, uint64_t& serial);
+
+// --capture-frame: true while the frame being built is the one to log in full.
+bool Capturing();
+
 }  // namespace s3n::render::backend

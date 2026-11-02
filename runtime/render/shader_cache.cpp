@@ -28,9 +28,9 @@ bool IsExec(uint32_t opcode) {
 }
 
 // Vertex fetch fields Direct3D sets when it binds a vertex declaration: the fetch
-// constant and prefetch count (dword 0), the format and its modes, above the destination
-// swizzle (dword 1), and the stride and offset (dword 2).
-constexpr uint32_t kBoundFetchFields[3] = {0x3FF00000, 0x7FFFF000, 0x7FFFFFFF};
+// constant and prefetch count (dword 0), the format, its modes and the destination swizzle
+// (dword 1: components the format lacks become 0 or 1), and the stride and offset (dword 2).
+constexpr uint32_t kBoundFetchFields[3] = {0x3FF00000, 0x7FFFFFFF, 0x7FFFFFFF};
 
 std::vector<uint8_t> gData;
 std::vector<Shader> gShaders;
@@ -38,13 +38,16 @@ std::unordered_map<uint64_t, Shader*> gByKey[2];  // vertex, pixel
 
 }  // namespace
 
-uint64_t ShaderKey(const uint8_t* microcode, size_t size) {
-    auto word = [microcode](size_t index) { return LoadBE32(microcode, uint32_t(index * 4)); };
+namespace {
 
-    // Instructions take 3 dwords. Control flow instructions are 48 bits, two to each
-    // 3-dword slot, from the start of the shader up to the first instruction a clause runs.
+// Walks the control flow. Instructions take 3 dwords; control flow instructions are 48
+// bits, two to each 3-dword slot, from the start of the shader up to the first
+// instruction a clause runs. Returns the slot after the last instruction any clause runs;
+// `fetches` gets the slots holding fetch instructions, in order.
+size_t WalkClauses(const uint8_t* microcode, size_t size, std::vector<size_t>& fetches) {
+    auto word = [microcode](size_t index) { return LoadBE32(microcode, uint32_t(index * 4)); };
     size_t slots = size / 12, first = slots, end = 0;
-    std::vector<size_t> fetches;
+    fetches.clear();
     for (size_t s = 0; s < first; ++s) {
         uint32_t w0 = word(3 * s), w1 = word(3 * s + 1), w2 = word(3 * s + 2);
         for (uint64_t cf : {w0 | uint64_t(w1 & 0xFFFF) << 32, w1 >> 16 | uint64_t(w2) << 16}) {
@@ -58,8 +61,28 @@ uint64_t ShaderKey(const uint8_t* microcode, size_t size) {
                 if (sequence >> (2 * i) & 1) fetches.push_back(address + i);
         }
     }
-    end = end ? std::min(end, slots) : slots;
     std::sort(fetches.begin(), fetches.end());
+    return end ? std::min(end, slots) : slots;
+}
+
+// The fetch constants the shader's texture fetches read.
+uint32_t TextureFetchMask(const uint8_t* microcode, size_t size) {
+    std::vector<size_t> fetches;
+    size_t end = WalkClauses(microcode, size, fetches);
+    uint32_t mask = 0;
+    for (size_t slot : fetches) {
+        uint32_t w0 = slot < end ? LoadBE32(microcode, uint32_t(slot * 12)) : 0;
+        if ((w0 & 0x1F) == 1) mask |= 1u << (w0 >> 20 & 0x1F);  // texture fetch
+    }
+    return mask;
+}
+
+}  // namespace
+
+uint64_t ShaderKey(const uint8_t* microcode, size_t size) {
+    auto word = [microcode](size_t index) { return LoadBE32(microcode, uint32_t(index * 4)); };
+    std::vector<size_t> fetches;
+    size_t end = WalkClauses(microcode, size, fetches);
 
     uint64_t hash = 0xCBF29CE484222325ull;
     auto next = fetches.begin();
@@ -134,6 +157,7 @@ size_t LoadShaderCache(const std::filesystem::path& path, std::string& error) {
         s.microcode = container + virtualSize + physicalOffset;
         s.microcodeSize = size;
         s.key = ShaderKey(s.microcode, size);
+        s.textureFetchMask = TextureFetchMask(s.microcode, size);
         s.spirv = reinterpret_cast<const uint32_t*>(gData.data() + e.spirvOffset);
         s.spirvSize = e.spirvSize;
         // Containers with the same code translate the same; the first one stands for them.

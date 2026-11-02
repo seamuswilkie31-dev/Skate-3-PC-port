@@ -26,4 +26,7 @@ void Swap(uint32_t frontBuffer, uint32_t width, uint32_t height);
 // without watching them.
 void DumpFrames(uint32_t interval, const std::string& folder);
 
+// --capture-frame: logs every clear, resolve and draw of one frame (counting from 1).
+void CaptureFrame(uint64_t frame);
+
 }  // namespace s3n::render

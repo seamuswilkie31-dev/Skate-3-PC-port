@@ -323,7 +323,8 @@ bool Init(std::string& error) {
     vkGetPhysicalDeviceFeatures2(vk.gpu, &supported);
     if (!supported12.bufferDeviceAddress || !supported12.descriptorIndexing || !supported12.runtimeDescriptorArray ||
         !supported12.descriptorBindingPartiallyBound || !supported12.descriptorBindingSampledImageUpdateAfterBind ||
-        !supported12.timelineSemaphore || !supported13.dynamicRendering || !supported.features.shaderInt64) {
+        !supported12.descriptorBindingUpdateUnusedWhilePending || !supported12.timelineSemaphore ||
+        !supported13.dynamicRendering || !supported.features.shaderInt64) {
         error = gGpuName +
                 " lacks Vulkan features the renderer needs (buffer device address, descriptor indexing, timeline "
                 "semaphores, dynamic rendering, 64-bit ints)";
@@ -339,6 +340,7 @@ bool Init(std::string& error) {
     enable12.descriptorBindingPartiallyBound = VK_TRUE;
     enable12.descriptorBindingVariableDescriptorCount = supported12.descriptorBindingVariableDescriptorCount;
     enable12.descriptorBindingSampledImageUpdateAfterBind = VK_TRUE;
+    enable12.descriptorBindingUpdateUnusedWhilePending = VK_TRUE;
     enable12.shaderSampledImageArrayNonUniformIndexing = supported12.shaderSampledImageArrayNonUniformIndexing;
     enable12.timelineSemaphore = VK_TRUE;
     VkPhysicalDeviceFeatures2 enable{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};

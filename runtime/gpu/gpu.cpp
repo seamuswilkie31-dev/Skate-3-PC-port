@@ -15,6 +15,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdlib>
+#include <cstring>
 #include <deque>
 #include <mutex>
 #include <thread>
@@ -155,8 +156,9 @@ void LoadShader(uint32_t type, const uint8_t* microcode, uint32_t dwords) {
 uint32_t ReadRegister(uint32_t index);
 
 // Direct3D's clear shader: bare microcode in its library (drawn by 82B53D40), so the
-// translated shaders don't have it. Its rectangles are cleared natively.
-constexpr uint64_t kDirect3DClearShader = 0x053B88DD5FD226F7ull;
+// translated shaders don't have it. Its rectangles are cleared natively. (Its ShaderKey:
+// a change to the key changes this.)
+constexpr uint64_t kDirect3DClearShader = 0x95FA1EC89F62BB53ull;
 
 // VGT_DRAW_INITIATOR: primitive type (bits 0-5), index source (6-7: 0 index buffer,
 // 1 immediate, 2 auto), 32-bit indices (bit 11), index or vertex count (16-31). Draws from an

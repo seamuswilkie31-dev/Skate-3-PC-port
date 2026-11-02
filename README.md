@@ -18,11 +18,11 @@ with real waits, events, mutexes, critical sections and timers. It reads its
 data from your ISO, drives an emulated GPU front end, and has an audio clock
 and a silent XMA decoder. Its whole boot sequence now runs: the EA intro,
 loading, then the title screen, where with no input it starts the
-attract-mode video. 391 of the game's 392 shaders translate to SPIR-V, and
-the runtime recognises them as the GPU loads them. Its render targets,
-clears and resolves run in Vulkan, and each frame's front buffer goes to the
-window. Ordinary draws aren't translated yet, so the window stays black, and
-there's no sound or input. See
+attract-mode video. All of it now renders in a Vulkan window: the language
+select, the intros, the title screen with its 3D scene, and the attract video.
+The game's own shaders are translated to SPIR-V, and its draws, textures,
+render targets and resolves run in Vulkan. There's no input yet (the title
+screen waits for Start) and no sound. See
 [docs/PHASE3.md](docs/PHASE3.md) for the details and what's next, and
 [docs/PHASE2.md](docs/PHASE2.md) for the recompilation work.
 
@@ -34,7 +34,7 @@ there's no sound or input. See
 | `scripts/recomp.ps1` | ISO → `default.xex` → xexscan → 219 MB of C++, in the work folder |
 | XenonRecomp patches | 39 missing instruction forms, D3D half-float packs, the console's 50 MHz timebase, fixes; Skate 3 has 0 unrecognized instructions and 0 traps |
 | `scripts/test_recomp.ps1` | 110 instruction tests (344 checks) against a Python reference model |
-| Runtime (`s3native.exe`) | Runs the game's start-up natively: guest memory, loader, guest threads on host threads, kernel objects and waits, critical sections, timers, files from the disc, GPU front end (`runtime/gpu`), Vulkan render targets, resolves and frames (`runtime/render`), audio clock, silent XMA decoder (`runtime/apu`); 117 kernel functions implemented, logging stubs for the other 169 |
+| Runtime (`s3native.exe`) | Runs the game's start-up natively: guest memory, loader, guest threads on host threads, kernel objects and waits, critical sections, timers, files from the disc, GPU front end (`runtime/gpu`), Vulkan renderer: draws, textures, render targets, resolves and frames (`runtime/render`), audio clock, silent XMA decoder (`runtime/apu`); 117 kernel functions implemented, logging stubs for the other 169 |
 
 ## Requirements
 
@@ -72,8 +72,9 @@ powershell -ExecutionPolicy Bypass -File scripts\build.ps1
    from `--game <path>`. Other options: `--no-window`, `--xex <path>`,
    `--log <file>`, `--stall <seconds>`, `--time-limit <seconds>`,
    `--watch <hex address>` to log every write to one guest word,
-   `--watch-reads <hex address>` for reads too, and `--dump-frames <n>` to
-   save every nth frame to `%LOCALAPPDATA%\Skate3Native\frames` as a BMP.
+   `--watch-reads <hex address>` for reads too, `--dump-frames <n>` to save
+   every nth frame to `%LOCALAPPDATA%\Skate3Native\frames` as a BMP, and
+   `--capture-frame <n>` to log every clear, resolve and draw of frame n.
 
 The launcher builds without any game files: `build.ps1 -Target s3launcher`.
 Settings live in `%APPDATA%\Skate3Native\config.ini`, saves in

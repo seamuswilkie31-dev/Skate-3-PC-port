@@ -85,10 +85,9 @@ first kernel calls.
 
 **Phase 3 — Kernel until graphics.** *(In progress: threads,
 synchronization, files, the GPU front end, audio clock and a silent XMA
-decoder done; boot reaches the title screen. Rendering has started: a Vulkan
-window, the Direct3D map, 391 of 392 shaders translated and recognised as the
-GPU loads them, and render targets, clears, resolves and the front buffer in
-Vulkan. See [PHASE3.md](PHASE3.md).)*
+decoder done. Exit reached: the whole boot renders in Vulkan, from the
+language select and the EA intro to the title screen and the attract video.
+See [PHASE3.md](PHASE3.md).)*
 Implement kernel/XAM imports in the
 order the game hits them: memory, threads, sync, files (served from the
 ISO), timers, XAM content/profile APIs. Identify the D3D library functions

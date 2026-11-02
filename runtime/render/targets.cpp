@@ -66,7 +66,9 @@ struct Texture {
     uint32_t address;
     uint32_t format;  // RB_COPY_DEST_INFO's
     Image image;
+    uint64_t serial = 0;  // new for each image made
 };
+uint64_t gTextureSerial = 0;
 
 struct Retired {
     Image image;
@@ -111,6 +113,7 @@ Image* gOpenColor = nullptr;
 Image* gOpenDepth = nullptr;
 
 uint32_t gDumpInterval = 0;
+uint64_t gCaptureFrame = 0;
 std::string gDumpFolder;
 
 std::atomic<uint64_t> gClears{0};
@@ -151,7 +154,8 @@ bool CreateUploadRing(UploadRing& ring, std::string& error) {
     VkBufferCreateInfo info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
     info.size = kUploadRingSize;
     info.usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
-                 VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+                 VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT |
+                 VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
     if (!Check(vkCreateBuffer(vk.device, &info, nullptr, &ring.buffer), "vkCreateBuffer", error)) return false;
     VkMemoryRequirements requirements;
     vkGetBufferMemoryRequirements(vk.device, ring.buffer, &requirements);
@@ -294,6 +298,20 @@ void EndRendering() {
     gRenderingOpen = false;
 }
 
+uint64_t FrameNumber() { return gFrames; }
+
+bool Capturing() { return gCaptureFrame && gFrames + 1 == gCaptureFrame; }
+
+Image* ResolvedImage(uint32_t address, uint64_t& serial) {
+    for (Texture& t : gTextures) {
+        if (t.address == address && t.image.image) {
+            serial = t.serial;
+            return &t.image;
+        }
+    }
+    return nullptr;
+}
+
 VkCommandBuffer Allocate(VkDeviceSize size, Upload& upload) {
     VkCommandBuffer cb = Commands();
     if (!cb || size > kUploadRingSize) return VK_NULL_HANDLE;
@@ -421,6 +439,7 @@ Image* DestinationTexture(uint32_t address, uint32_t width, uint32_t height, VkF
         texture = &gTextures.back();
     }
     texture->format = guestFormat;
+    texture->serial = ++gTextureSerial;
     std::string error;
     if (!CreateImage(texture->image, format, width, height, VK_SAMPLE_COUNT_1_BIT,
                      VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, cb,
@@ -489,6 +508,33 @@ void ClearTargets(VkCommandBuffer cb, Image* color, const VkClearColorValue& col
     BeginRendering(cb, color, depth && depthAspects ? depth : nullptr);
     vkCmdClearAttachments(cb, clearCount, clears, 1, &rect);
     Operation();
+}
+
+uint32_t TilesPerRow(uint32_t pitch, uint32_t msaa, uint32_t format, bool depth) {
+    uint32_t samplesX = msaa == 2 ? 2 : 1, tileWidth = !depth && Is64Bit(format) ? 40 : 80;
+    return (pitch * samplesX + tileWidth - 1) / tileWidth;
+}
+
+// Clears `r` (pixels) of the render target at this EDRAM base, and of every other render
+// target laid out over the same tiles: Direct3D clears through an MSAA view of a surface
+// (a 640x360 4x target holds a 1280x720 one's samples), so a clear has to reach every view
+// of those samples. Each gets the rectangle in its own pixels.
+void ClearEdram(VkCommandBuffer cb, bool depth, uint32_t base, uint32_t pitch, uint32_t msaa, uint32_t format, Rect r,
+                const VkClearColorValue& colorValue, const VkClearDepthStencilValue& depthValue,
+                VkImageAspectFlags aspects) {
+    if (!FindTarget(base, pitch, msaa, format, depth, cb)) return;
+    uint32_t sx = msaa == 2 ? 2 : 1, sy = msaa ? 2 : 1, row = TilesPerRow(pitch, msaa, format, depth);
+    Rect samples{r.x0 * int32_t(sx), r.y0 * int32_t(sy), r.x1 * int32_t(sx), r.y1 * int32_t(sy)};
+    for (Target& t : gTargets) {
+        if (t.depth != depth || t.base != base || TilesPerRow(t.pitch, t.msaa, t.format, depth) != row) continue;
+        if (!depth && Is64Bit(t.format) != Is64Bit(format)) continue;
+        int32_t tx = t.msaa == 2 ? 2 : 1, ty = t.msaa ? 2 : 1;
+        Rect p{samples.x0 / tx, samples.y0 / ty, (samples.x1 + tx - 1) / tx, (samples.y1 + ty - 1) / ty};
+        if (depth)
+            ClearTargets(cb, nullptr, colorValue, &t.image, aspects, depthValue, p);
+        else
+            ClearTargets(cb, &t.image, colorValue, nullptr, 0, depthValue, p);
+    }
 }
 
 // Copies `edram` from the render target to the resolve's destination texture, where
@@ -602,24 +648,21 @@ void ClearRectangle() {
     Rect r = InEdram(VertexRect(vertices, 7));
     uint32_t surface = Register(reg::kRbSurfaceInfo), pitch = surface & 0x3FFF, msaa = surface >> 16 & 3;
 
-    Image* color = nullptr;
-    if ((Register(reg::kRbModeControl) & 7) == reg::kEdramModeColorDepth && (Register(reg::kRbColorMask) & 0xF)) {
-        uint32_t info = Register(reg::kRbColorInfo);
-        color = FindTarget(info & 0xFFF, pitch, msaa, info >> 16 & 0xF, false, cb);
-    }
+    bool color = (Register(reg::kRbModeControl) & 7) == reg::kEdramModeColorDepth && (Register(reg::kRbColorMask) & 0xF);
+    uint32_t colorInfo = Register(reg::kRbColorInfo), depthInfo = Register(reg::kRbDepthInfo);
     uint32_t depthControl = Register(reg::kRbDepthControl);
     VkImageAspectFlags aspects = ((depthControl & 6) == 6 ? VK_IMAGE_ASPECT_DEPTH_BIT : 0) |
                                  (depthControl & 1 ? VK_IMAGE_ASPECT_STENCIL_BIT : 0);
-    Image* depth = nullptr;
-    if (aspects) {
-        uint32_t info = Register(reg::kRbDepthInfo);
-        depth = FindTarget(info & 0xFFF, pitch, msaa, info >> 16 & 1, true, cb);
-    }
     VkClearColorValue colorValue{};
     for (int i = 0; i < 4; ++i) colorValue.float32[i] = LoadFloat(vertices, 3 + i);
     VkClearDepthStencilValue depthValue{std::clamp(LoadFloat(vertices, 2), 0.0f, 1.0f),
                                         Register(reg::kRbStencilRefMask) & 0xFF};
-    ClearTargets(cb, color, colorValue, depth, aspects, depthValue, r);
+    if (Capturing())
+        kernel::Log("  capture: clear (%d,%d)-(%d,%d) of surface %08X: colour %s (%.2f %.2f %.2f %.2f) depth %s %.3f\n",
+                    r.x0, r.y0, r.x1, r.y1, surface, color ? "yes" : "no", colorValue.float32[0], colorValue.float32[1],
+                    colorValue.float32[2], colorValue.float32[3], aspects ? "yes" : "no", depthValue.depth);
+    if (color) ClearEdram(cb, false, colorInfo & 0xFFF, pitch, msaa, colorInfo >> 16 & 0xF, r, colorValue, depthValue, 0);
+    if (aspects) ClearEdram(cb, true, depthInfo & 0xFFF, pitch, msaa, depthInfo >> 16 & 1, r, colorValue, depthValue, aspects);
     ++gClears;
 }
 
@@ -630,6 +673,10 @@ void Resolve() {
     uint32_t surface = Register(reg::kRbSurfaceInfo), pitch = surface & 0x3FFF, msaa = surface >> 16 & 3;
     uint32_t control = Register(reg::kRbCopyControl);
     uint32_t source = control & 7, command = control >> 20 & 3;
+    if (Capturing())
+        kernel::Log("  capture: resolve source %u (surface %08X, colour %08X) (%d,%d)-(%d,%d) to %08X pitch %08X info %08X, "
+                    "control %08X\n", source, surface, Register(reg::kRbColorInfo), screen.x0, screen.y0, screen.x1, screen.y1,
+                    Register(reg::kRbCopyDestBase), Register(reg::kRbCopyDestPitch), Register(reg::kRbCopyDestInfo), control);
 
     Image* color = nullptr;
     if (source < 4) {
@@ -651,14 +698,15 @@ void Resolve() {
         value.float32[1] = float(packed >> 8 & 0xFF) / 255.0f;
         value.float32[2] = float(packed & 0xFF) / 255.0f;
         value.float32[3] = float(packed >> 24) / 255.0f;
-        ClearTargets(cb, color, value, nullptr, 0, {}, edram);
+        uint32_t info = Register(source == 0 ? reg::kRbColorInfo : reg::kRbColor1Info + source - 1);
+        ClearEdram(cb, false, info & 0xFFF, pitch, msaa, info >> 16 & 0xF, edram, value, {}, 0);
         ++gResolveClears;
     }
     if (control >> 9 & 1) {
         uint32_t info = Register(reg::kRbDepthInfo), packed = Register(reg::kRbDepthClear);
-        Image* depth = FindTarget(info & 0xFFF, pitch, msaa, info >> 16 & 1, true, cb);
         VkClearDepthStencilValue value{float(packed >> 8) / float(0xFFFFFF), packed & 0xFF};
-        ClearTargets(cb, nullptr, {}, depth, VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT, value, edram);
+        ClearEdram(cb, true, info & 0xFFF, pitch, msaa, info >> 16 & 1, edram, {}, value,
+                   VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT);
         ++gResolveClears;
     }
 }
@@ -710,6 +758,8 @@ void Swap(uint32_t frontBuffer, uint32_t width, uint32_t height) {
     }
     DestroyReadback(readback);
 }
+
+void CaptureFrame(uint64_t frame) { gCaptureFrame = frame; }
 
 void DumpFrames(uint32_t interval, const std::string& folder) {
     std::error_code error;

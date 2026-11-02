@@ -6,6 +6,7 @@
 #include "memory.h"
 #include "render/backend.h"
 #include "render/shader_cache.h"
+#include "render/textures.h"
 #include "render/vulkan.h"
 
 #include <algorithm>
@@ -42,14 +43,13 @@ bool IsUintUsage(uint32_t usage) { return usage == 2 || usage == 3 || usage == 6
 
 // The shared constants: texture slots per sampler register for 2D, 3D and cube textures,
 // sampler slots, then the booleans and a few draw values.
+constexpr uint32_t kSharedSamplers = 192;  // textures: 64 bytes per kind (2D, 3D, cube) from 0
 constexpr uint32_t kSharedBooleans = 256;
 constexpr uint32_t kSharedHalfPixelOffset = 264;
 constexpr uint32_t kSharedAlphaThreshold = 272;
 constexpr uint32_t kSharedSize = 512;
 constexpr uint32_t kSpecAlphaTest = 1 << 1;
 constexpr uint32_t kStageConstantsSize = 256 * 16;  // one stage's float4 constants
-constexpr uint32_t kTextureSlots[3] = {4096, 256, 256};  // 2D, 3D, cube
-constexpr uint32_t kSamplerSlots = 256;
 constexpr uint32_t kMaxVertices = 1u << 20;
 
 enum Skip { kNoWindow, kEdramMode, kScreenSpace, kPrimitive, kIndices, kTooBig, kNoTarget, kViewport, kPipeline,
@@ -113,15 +113,8 @@ std::unordered_map<PipelineKey, VkPipeline, KeyHash, KeyEqual> gPipelines;
 
 bool gSetUp = false;
 bool gUnavailable = false;
-VkDescriptorSetLayout gSetLayouts[4] = {};
-VkDescriptorPool gDescriptorPool = VK_NULL_HANDLE;
-VkDescriptorSet gSets[4] = {};
 VkPipelineLayout gPipelineLayout = VK_NULL_HANDLE;
 VkPipelineCache gPipelineCache = VK_NULL_HANDLE;
-VkImage gDefaultImages[3] = {};
-VkDeviceMemory gDefaultMemory[3] = {};
-VkImageView gDefaultViews[3] = {};
-VkSampler gDefaultSampler = VK_NULL_HANDLE;
 
 std::string Describe() {
     std::string out = "draws: " + std::to_string(gDrawn.load()) + " drawn with " + std::to_string(gPipelineCount.load()) +
@@ -145,141 +138,27 @@ float RegisterFloat(uint32_t index) {
 
 int32_t SignExtend(uint32_t value, uint32_t bits) { return int32_t(value << (32 - bits)) >> (32 - bits); }
 
-// A 1x1 white image of each kind the shaders sample (2D, 3D, cube), standing in for
-// every texture until textures are converted.
-bool CreateDefaultImage(int kind, VkCommandBuffer cb, std::string& error) {
-    Vulkan& vk = Vk();
-    VkImageCreateInfo info{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
-    info.imageType = kind == 1 ? VK_IMAGE_TYPE_3D : VK_IMAGE_TYPE_2D;
-    info.flags = kind == 2 ? VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT : 0;
-    info.format = VK_FORMAT_R8G8B8A8_UNORM;
-    info.extent = {1, 1, 1};
-    info.mipLevels = 1;
-    info.arrayLayers = kind == 2 ? 6 : 1;
-    info.samples = VK_SAMPLE_COUNT_1_BIT;
-    info.tiling = VK_IMAGE_TILING_OPTIMAL;
-    info.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
-    if (!Check(vkCreateImage(vk.device, &info, nullptr, &gDefaultImages[kind]), "vkCreateImage", error)) return false;
-    VkMemoryRequirements requirements;
-    vkGetImageMemoryRequirements(vk.device, gDefaultImages[kind], &requirements);
-    VkMemoryAllocateInfo alloc{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
-    alloc.allocationSize = requirements.size;
-    for (uint32_t i = 0; i < vk.memory.memoryTypeCount; ++i) {
-        if (requirements.memoryTypeBits >> i & 1) {
-            alloc.memoryTypeIndex = i;
-            break;
-        }
-    }
-    if (!Check(vkAllocateMemory(vk.device, &alloc, nullptr, &gDefaultMemory[kind]), "vkAllocateMemory", error) ||
-        !Check(vkBindImageMemory(vk.device, gDefaultImages[kind], gDefaultMemory[kind], 0), "vkBindImageMemory", error))
-        return false;
-    VkImageViewCreateInfo view{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
-    view.image = gDefaultImages[kind];
-    view.viewType = kind == 0 ? VK_IMAGE_VIEW_TYPE_2D : kind == 1 ? VK_IMAGE_VIEW_TYPE_3D : VK_IMAGE_VIEW_TYPE_CUBE;
-    view.format = info.format;
-    view.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, info.arrayLayers};
-    if (!Check(vkCreateImageView(vk.device, &view, nullptr, &gDefaultViews[kind]), "vkCreateImageView", error))
-        return false;
-    VkImageMemoryBarrier barrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
-    barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    barrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
-    barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-    barrier.srcQueueFamilyIndex = barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    barrier.image = gDefaultImages[kind];
-    barrier.subresourceRange = view.subresourceRange;
-    vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0,
-                         nullptr, 1, &barrier);
-    VkClearColorValue white{{1.0f, 1.0f, 1.0f, 1.0f}};
-    vkCmdClearColorImage(cb, gDefaultImages[kind], VK_IMAGE_LAYOUT_GENERAL, &white, 1, &view.subresourceRange);
-    return true;
-}
-
-// The bindless descriptor sets the shaders index (sets 0-2: 2D, 3D and cube textures; set
-// 3: samplers), the pipeline layout, and the stand-in white images in slot 0.
+// The pipeline layout: the texture sets (textures.h) and the three constant addresses.
 bool SetUp(VkCommandBuffer cb) {
     if (gSetUp) return true;
     if (gUnavailable) return false;
     gUnavailable = true;  // until it works
     Vulkan& vk = Vk();
     std::string error;
-    EndRendering();
-    VkDescriptorBindingFlags bindingFlags =
-        VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT | VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT;
-    for (int i = 0; i < 4; ++i) {
-        VkDescriptorSetLayoutBinding binding{};
-        binding.binding = 0;
-        binding.descriptorType = i < 3 ? VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE : VK_DESCRIPTOR_TYPE_SAMPLER;
-        binding.descriptorCount = i < 3 ? kTextureSlots[i] : kSamplerSlots;
-        binding.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
-        VkDescriptorSetLayoutBindingFlagsCreateInfo flags{
-            VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO};
-        flags.bindingCount = 1;
-        flags.pBindingFlags = &bindingFlags;
-        VkDescriptorSetLayoutCreateInfo layout{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-        layout.pNext = &flags;
-        layout.flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_UPDATE_AFTER_BIND_POOL_BIT;
-        layout.bindingCount = 1;
-        layout.pBindings = &binding;
-        if (!Check(vkCreateDescriptorSetLayout(vk.device, &layout, nullptr, &gSetLayouts[i]),
-                   "vkCreateDescriptorSetLayout", error))
-            break;
-    }
-    VkDescriptorPoolSize sizes[2] = {
-        {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, kTextureSlots[0] + kTextureSlots[1] + kTextureSlots[2]},
-        {VK_DESCRIPTOR_TYPE_SAMPLER, kSamplerSlots}};
-    VkDescriptorPoolCreateInfo pool{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
-    pool.flags = VK_DESCRIPTOR_POOL_CREATE_UPDATE_AFTER_BIND_BIT;
-    pool.maxSets = 4;
-    pool.poolSizeCount = 2;
-    pool.pPoolSizes = sizes;
-    VkDescriptorSetAllocateInfo alloc{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
-    alloc.descriptorSetCount = 4;
-    alloc.pSetLayouts = gSetLayouts;
+    if (!textures::SetUp(cb)) return false;
     VkPushConstantRange push{VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, 3 * sizeof(uint64_t)};
     VkPipelineLayoutCreateInfo layout{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
     layout.setLayoutCount = 4;
-    layout.pSetLayouts = gSetLayouts;
+    layout.pSetLayouts = textures::SetLayouts();
     layout.pushConstantRangeCount = 1;
     layout.pPushConstantRanges = &push;
     VkPipelineCacheCreateInfo cache{VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO};
-    VkSamplerCreateInfo sampler{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
-    sampler.magFilter = sampler.minFilter = VK_FILTER_LINEAR;
-    sampler.mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR;
-    sampler.addressModeU = sampler.addressModeV = sampler.addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT;
-    sampler.maxLod = VK_LOD_CLAMP_NONE;
-    bool ok = gSetLayouts[3] &&
-              Check(vkCreateDescriptorPool(vk.device, &pool, nullptr, &gDescriptorPool), "vkCreateDescriptorPool",
-                    error);
-    alloc.descriptorPool = gDescriptorPool;
-    ok = ok && Check(vkAllocateDescriptorSets(vk.device, &alloc, gSets), "vkAllocateDescriptorSets", error) &&
-              Check(vkCreatePipelineLayout(vk.device, &layout, nullptr, &gPipelineLayout), "vkCreatePipelineLayout",
-                    error) &&
-              Check(vkCreatePipelineCache(vk.device, &cache, nullptr, &gPipelineCache), "vkCreatePipelineCache",
-                    error) &&
-              Check(vkCreateSampler(vk.device, &sampler, nullptr, &gDefaultSampler), "vkCreateSampler", error);
-    for (int kind = 0; ok && kind < 3; ++kind) ok = CreateDefaultImage(kind, cb, error);
-    if (!ok) {
+    if (!Check(vkCreatePipelineLayout(vk.device, &layout, nullptr, &gPipelineLayout), "vkCreatePipelineLayout",
+               error) ||
+        !Check(vkCreatePipelineCache(vk.device, &cache, nullptr, &gPipelineCache), "vkCreatePipelineCache", error)) {
         kernel::Log("  draws: can't set up: %s\n", error.c_str());
         return false;
     }
-    FullBarrier(cb);
-
-    VkDescriptorImageInfo images[3], samplerInfo{gDefaultSampler, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_UNDEFINED};
-    VkWriteDescriptorSet writes[4]{};
-    for (int i = 0; i < 4; ++i) {
-        writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        writes[i].dstSet = gSets[i];
-        writes[i].descriptorCount = 1;
-        if (i < 3) {
-            images[i] = {VK_NULL_HANDLE, gDefaultViews[i], VK_IMAGE_LAYOUT_GENERAL};
-            writes[i].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
-            writes[i].pImageInfo = &images[i];
-        } else {
-            writes[i].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
-            writes[i].pImageInfo = &samplerInfo;
-        }
-    }
-    vkUpdateDescriptorSets(vk.device, 4, writes, 0, nullptr);
     kernel::AddReportSection(Describe);
     gUnavailable = false;
     gSetUp = true;
@@ -688,6 +567,17 @@ void Draw(const DrawCall& call) {
     if (fetches.size() > 16) fetches.resize(16);
     uint32_t vertexStride = uint32_t(fetches.size()) * 16;
 
+    // Textures first: converting one records an upload.
+    VkCommandBuffer setup = Commands();
+    if (!setup || !SetUp(setup)) {
+        ++gSkipped[kNoWindow];
+        return;
+    }
+    textures::Slots slots[16];
+    uint32_t textureMask = (call.vertexShader->textureFetchMask | call.pixelShader->textureFetchMask) & 0xFFFF;
+    for (uint32_t s = 0; s < 16; ++s)
+        if (textureMask >> s & 1) slots[s] = textures::Bind(s);
+
     // Everything the draw reads, in one block of the upload ring: both stages' constants,
     // the shared constants, the vertices and the indices.
     size_t vertexAt = Align(2 * kStageConstantsSize + kSharedSize);
@@ -695,7 +585,7 @@ void Draw(const DrawCall& call) {
     size_t total = indexAt + indices.size() * 4;
     Upload upload;
     VkCommandBuffer cb = Allocate(total, upload);
-    if (!cb || !SetUp(cb)) {
+    if (!cb) {
         ++gSkipped[kNoWindow];
         return;
     }
@@ -703,7 +593,11 @@ void Draw(const DrawCall& call) {
     std::memcpy(upload.data, registers + reg::kAluConstants, kStageConstantsSize);
     std::memcpy(upload.data + kStageConstantsSize, registers + reg::kPixelAluConstants, kStageConstantsSize);
     uint8_t* shared = upload.data + 2 * kStageConstantsSize;
-    std::memset(shared, 0, kSharedSize);  // every texture and sampler: slot 0
+    std::memset(shared, 0, kSharedSize);  // slot 0: white, and the default sampler
+    for (uint32_t s = 0; s < 16; ++s) {
+        std::memcpy(shared + slots[s].kind * 64 + s * 4, &slots[s].texture, 4);
+        std::memcpy(shared + kSharedSamplers + s * 4, &slots[s].sampler, 4);
+    }
     uint32_t booleans = (registers[reg::kBoolConstants] & 0xFFFF) | registers[reg::kBoolConstants + 4] << 16;
     std::memcpy(shared + kSharedBooleans, &booleans, 4);
     float scale[6];
@@ -766,14 +660,17 @@ void Draw(const DrawCall& call) {
         return;
     }
 
-    // Viewport and scissor, moved by the window offset (each tile of a tiled screen).
+    // Viewport and scissor, moved by the window offset (each tile of a tiled screen). The
+    // GPU puts a position at offset + position * scale on screen. The translated vertex
+    // shaders already negate y for Vulkan (DXC's -fvk-invert-y), so the viewport's height
+    // is -2 * y scale (positive: Direct3D's y scale is negative) from offset + y scale.
     uint32_t windowOffset = Register(reg::kPaScWindowOffset);
     int32_t offsetX = SignExtend(windowOffset & 0x7FFF, 15), offsetY = SignExtend(windowOffset >> 16 & 0x7FFF, 15);
     float vx = modeControl >> 16 & 1 ? float(offsetX) : 0.0f, vy = modeControl >> 16 & 1 ? float(offsetY) : 0.0f;
     VkViewport viewport{scale[1] - scale[0] + vx,
-                        scale[3] - scale[2] + vy,
+                        scale[3] + scale[2] + vy,
                         2.0f * scale[0],
-                        2.0f * scale[2],
+                        -2.0f * scale[2],
                         std::clamp(scale[5], 0.0f, 1.0f),
                         std::clamp(scale[5] + scale[4], 0.0f, 1.0f)};
     uint32_t tl = Register(reg::kPaScWindowScissorTl), br = Register(reg::kPaScWindowScissorBr);
@@ -787,10 +684,28 @@ void Draw(const DrawCall& call) {
     if (x0 >= x1 || y0 >= y1) return;
     VkRect2D scissor{{x0, y0}, {uint32_t(x1 - x0), uint32_t(y1 - y0)}};
 
+    if (Capturing()) {
+        std::string textureList;
+        for (uint32_t s = 0; s < 16; ++s) {
+            if (!(textureMask >> s & 1)) continue;
+            uint32_t base = Register(reg::kFetchConstants + s * 6 + 1), size = Register(reg::kFetchConstants + s * 6 + 2);
+            char item[96];
+            std::snprintf(item, sizeof item, " t%u=%08X/fmt%u/%ux%u/slot%u", s, base & 0x1FFFF000, base & 0x3F,
+                          (size & 0x1FFF) + 1, (size >> 13 & 0x1FFF) + 1, slots[s].texture);
+            textureList += item;
+        }
+        kernel::Log("  capture: draw %016llX/%016llX prim %u count %u target %08X/%08X/%08X mode %u viewport (%.0f,%.0f "
+                    "%.0fx%.0f) scissor (%d,%d)-(%d,%d) blend %08X mask %X depth %08X%s\n",
+                    call.vertexShader->containerHash, call.pixelShader->containerHash, primitive, count, surface,
+                    Register(reg::kRbColorInfo), depthInfo, mode, viewport.x, viewport.y, viewport.width,
+                    viewport.height, x0, y0, x1, y1, key.blendControl, key.colorMask, key.depthControl,
+                    textureList.c_str());
+    }
+
     // Record.
     BeginRendering(cb, color, depth);
     vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
-    vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, gPipelineLayout, 0, 4, gSets, 0, nullptr);
+    vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, gPipelineLayout, 0, 4, textures::Sets(), 0, nullptr);
     uint64_t addresses[3] = {upload.address, upload.address + kStageConstantsSize,
                              upload.address + 2 * kStageConstantsSize};
     vkCmdPushConstants(cb, gPipelineLayout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0,

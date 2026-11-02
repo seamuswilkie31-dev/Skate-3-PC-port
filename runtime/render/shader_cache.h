@@ -21,6 +21,7 @@ struct Shader {
     uint32_t containerSize = 0;
     const uint8_t* microcode = nullptr;  // inside the container
     uint32_t microcodeSize = 0;          // bytes
+    uint32_t textureFetchMask = 0;       // the fetch constants (0-31) its texture fetches read
     const uint32_t* spirv = nullptr;
     uint32_t spirvSize = 0;  // bytes
     void* module = nullptr;  // VkShaderModule, once the renderer has made it
