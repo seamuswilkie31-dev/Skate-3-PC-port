@@ -4,9 +4,10 @@
 // samples at 48 kHz, about every 5.3 ms, by calling its callback. The title's audio
 // engine does its mixing and timekeeping in that callback, and anything synchronized to
 // audio (movie playback, for one) waits on it. A runtime thread calls the callbacks at
-// that rate; the frames the title submits are counted and dropped until there's audio
-// output (phase 4).
+// that rate, and the frames the title submits are played (apu/output.h). The device then
+// sets the pace: the clock runs a little faster or slower to keep a few frames queued.
 
+#include "apu/output.h"
 #include "kernel/kernel.h"
 #include "memory.h"
 
@@ -24,7 +25,10 @@ namespace {
 
 constexpr uint32_t kDriverMagic = 0x41550000;  // driver handles: magic | client index
 constexpr size_t kMaxClients = 8;
-constexpr auto kFramePeriod = std::chrono::nanoseconds(1000000000ll * 256 / 48000);
+constexpr auto kFramePeriod = std::chrono::nanoseconds(1000000000ll * apu::kFrameSamples / apu::kOutputRate);
+// Frames waiting in the device's queue: below the first the clock speeds up by an eighth,
+// above the second it slows down as much (about 21 and 64 ms of sound).
+constexpr uint32_t kFewQueued = 4, kManyQueued = 12;
 
 struct Client {
     uint32_t callback = 0;
@@ -40,10 +44,18 @@ std::atomic<uint64_t> gFramesSubmitted{0};
 void AudioClock(PPCContext& ctx, uint8_t* base) {
     using Clock = std::chrono::steady_clock;
     Clock::time_point next = Clock::now();
+    uint64_t submitted = 0;
     for (;;) {
         next += kFramePeriod;
         Clock::time_point now = Clock::now();
         if (next < now - std::chrono::milliseconds(50)) next = now;  // fell far behind: don't burst
+        // Only while the title is feeding the device: until then its queue says nothing.
+        if (apu::OutputOpen() && gFramesSubmitted != submitted) {
+            uint32_t queued = apu::QueuedFrames();
+            if (queued < kFewQueued) next -= kFramePeriod / 8;
+            else if (queued > kManyQueued) next += kFramePeriod / 8;
+        }
+        submitted = gFramesSubmitted;
         std::this_thread::sleep_until(next);
         std::array<Client, kMaxClients> clients;
         {
@@ -60,8 +72,8 @@ void AudioClock(PPCContext& ctx, uint8_t* base) {
 
 std::string Describe() {
     char line[128];
-    std::snprintf(line, sizeof line, "audio: %llu frames requested, %llu submitted (not played yet)\n",
-                  gFramesRequested.load(), gFramesSubmitted.load());
+    std::snprintf(line, sizeof line, "audio: %llu frames requested, %llu submitted\n", gFramesRequested.load(),
+                  gFramesSubmitted.load());
     return line;
 }
 
@@ -113,6 +125,7 @@ PPC_FUNC(__imp__XAudioUnregisterRenderDriverClient) {
 // for each of 6 channels.
 PPC_FUNC(__imp__XAudioSubmitRenderDriverFrame) {
     Trace(ctx, "XAudioSubmitRenderDriverFrame", true);
+    if (ctx.r4.u32) apu::PlayFrame(base + ctx.r4.u32);
     ++gFramesSubmitted;
     ctx.r3.u64 = 0;
 }

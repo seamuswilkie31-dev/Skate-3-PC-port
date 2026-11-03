@@ -1,9 +1,9 @@
 #pragma once
 
 // The console's XMA audio decoder. Titles hand it compressed packets through contexts in
-// physical memory and read 16-bit PCM back from an output ring. For now the decoder is
-// silent: it consumes input at a steady rate and fills the output with zeros, which is
-// enough for a title's audio engine to keep streaming. Real decoding comes in phase 4.
+// physical memory and read 16-bit big-endian PCM back from an output ring. XMA frames are
+// WMA Pro frames, so FFmpeg's WMA Pro decoder does the decoding; xma.cpp walks the packets
+// and the context's buffers, loops and output ring the way the hardware does.
 
 #include <cstdint>
 

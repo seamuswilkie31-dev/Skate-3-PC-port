@@ -56,5 +56,5 @@ add_executable(s3native main.cpp memory.cpp loader.cpp disc.cpp ${S3N_KERNEL_SOU
     "${S3N_IMPORT_STUBS}" ${S3N_SPIRV})
 target_include_directories(s3native PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}" "${S3N_SHADER_OUT}")
 target_compile_definitions(s3native PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
-target_link_libraries(s3native PRIVATE s3n_guest s3n_common SDL3::SDL3-static Vulkan::Vulkan)
+target_link_libraries(s3native PRIVATE s3n_guest s3n_common SDL3::SDL3-static Vulkan::Vulkan FFmpeg::avcodec)
 target_compile_options(s3native PRIVATE ${S3N_RECOMP_FLAGS})

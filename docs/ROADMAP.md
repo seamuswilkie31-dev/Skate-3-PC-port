@@ -94,9 +94,10 @@ ISO), timers, XAM content/profile APIs. Identify the D3D library functions
 and hook them. Vulkan device, swapchain, shader translation. *Exit:* first
 frame — the EA logo / main menu renders.
 
-**Phase 4 — Input & audio.** *(In progress: pads, keyboard and mouse done;
-the game takes Start and A and stops at the storage device prompt, which is
-phase 5's. See [PHASE4.md](PHASE4.md).)* SDL3 gamepads mapped to XInput; keyboard and
+**Phase 4 — Input & audio.** *(In progress: pads, keyboard and mouse done,
+and sound: XMA decoded with FFmpeg's WMA Pro decoder and played through
+SDL3. Left: key bindings in the launcher and tuning the mouse's flick. See
+[PHASE4.md](PHASE4.md).)* SDL3 gamepads mapped to XInput; keyboard and
 mouse mapped onto the same virtual pad (keys for the left stick and buttons,
 mouse movement for the right stick and Flick-It), with bindings in the
 launcher; XMA audio decode. *Exit:* menus are navigable with Xbox,

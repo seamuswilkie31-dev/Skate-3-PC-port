@@ -4,7 +4,7 @@
 //            [--stall <seconds>] [--time-limit <seconds>] [--watch <hex address>]
 //            [--watch-reads <hex address>] [--no-window] [--dump-frames <interval>]
 //            [--capture-frame <frame>] [--press <button:seconds,...>] [--profile-thread <n>]
-//            [--vblank-hz <n>]
+//            [--vblank-hz <n>] [--mute] [--audio-wav <file>]
 //
 // Loads the game, mounts its disc (--game, or the launcher's choice in config.ini),
 // opens the game window, starts the entry point on a guest main thread, and logs every
@@ -13,8 +13,10 @@
 // --dump-frames n writes every nth frame to <work>\frames as a BMP; --capture-frame n logs every
 // clear, resolve and draw of frame n; --press presses pad buttons on a schedule (input.h);
 // --profile-thread n samples where guest thread n spends its time; --vblank-hz n overrides the
-// vertical blank rate the launcher's frame rate cap gives (twice the cap).
+// vertical blank rate the launcher's frame rate cap gives (twice the cap). --mute plays silence
+// (the audio timing stays as with sound); --audio-wav records the sound to a WAV file.
 
+#include "apu/output.h"
 #include "apu/xma.h"
 #include "config.h"
 #include "disc.h"
@@ -48,14 +50,15 @@ std::string DefaultWorkPath(const char* leaf) {
 int main(int argc, char** argv) {
     std::string xexPath = DefaultWorkPath("game\\default.xex");
     std::string logPath = DefaultWorkPath("s3native.log");
-    std::string gameSource, presses;
+    std::string gameSource, presses, audioWav;
     double vblankRate = 0.0;  // --vblank-hz, else from the launcher's frame rate cap
-    bool window = true;
+    bool window = true, mute = false;
     kernel::Options options;
     for (int i = 1; i < argc; i += 2) {
         std::string key = argv[i];
-        if (key == "--no-window") {
-            window = false;
+        if (key == "--no-window" || key == "--mute") {
+            if (key == "--mute") mute = true;
+            else window = false;
             --i;  // a flag without a value
             continue;
         }
@@ -70,6 +73,7 @@ int main(int argc, char** argv) {
         else if (key == "--dump-frames") render::DumpFrames(uint32_t(std::atoi(argv[i + 1])), DefaultWorkPath("frames"));
         else if (key == "--profile-thread") kernel::ProfileThread(uint32_t(std::atoi(argv[i + 1])));
         else if (key == "--vblank-hz") vblankRate = std::atof(argv[i + 1]);
+        else if (key == "--audio-wav") audioWav = argv[i + 1];
         else if (key == "--watch") options.watchAddress = uint32_t(std::strtoul(argv[i + 1], nullptr, 16));
         else if (key == "--watch-reads") {
             options.watchAddress = uint32_t(std::strtoul(argv[i + 1], nullptr, 16));
@@ -161,7 +165,10 @@ int main(int argc, char** argv) {
         kernel::Log("s3native: can't open the game window: %s\n", error.c_str());
         return 1;
     }
-    if (window) input::Init(config.input);
+    if (window) {
+        input::Init(config.input);
+        apu::OpenOutput(mute, audioWav);
+    }
     if (!presses.empty() && !input::ScriptPresses(presses, error)) {
         kernel::Log("s3native: %s\n", error.c_str());
         return 1;

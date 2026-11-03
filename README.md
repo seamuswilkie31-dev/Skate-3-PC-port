@@ -15,8 +15,8 @@ will be built, and the phase plan.
 Phase 3 in progress. Skate 3's recompiled code runs natively on 24 guest
 threads (render, loader, file-system, audio, movie, network and job threads)
 with real waits, events, mutexes, critical sections and timers. It reads its
-data from your ISO, drives an emulated GPU front end, and has an audio clock
-and a silent XMA decoder. Its whole boot sequence now runs: the EA intro,
+data from your ISO, drives an emulated GPU front end, and plays its sound:
+XMA audio decoded with FFmpeg, through SDL3. Its whole boot sequence now runs: the EA intro,
 loading, then the title screen, where with no input it starts the
 attract-mode video. All of it now renders in a Vulkan window: the language
 select, the intros, the title screen with its 3D scene, and the attract video.
@@ -25,8 +25,8 @@ render targets and resolves run in Vulkan. Pads, keyboard and mouse work,
 and so do saves: the game creates its save in
 `%APPDATA%\Skate3Native\saves`, loads it on the next boot, and plays the
 new-player flow (difficulty, camera, intro film, team and skater) into the
-skater editor, which renders the skater in 3D. The world hasn't been reached
-yet, there are no shadows, and there's no sound. See
+skater editor, which renders the skater in 3D, and on into the open world,
+with its sky and shadows, at about 58 fps. See
 [docs/PHASE3.md](docs/PHASE3.md) for the details and what's next, and
 [docs/PHASE2.md](docs/PHASE2.md) for the recompilation work.
 
@@ -38,14 +38,15 @@ yet, there are no shadows, and there's no sound. See
 | `scripts/recomp.ps1` | ISO → `default.xex` → xexscan → 219 MB of C++, in the work folder |
 | XenonRecomp patches | 39 missing instruction forms, D3D half-float packs, the console's 50 MHz timebase, fixes; Skate 3 has 0 unrecognized instructions and 0 traps |
 | `scripts/test_recomp.ps1` | 110 instruction tests (344 checks) against a Python reference model |
-| Runtime (`s3native.exe`) | Runs the game's start-up natively: guest memory, loader, guest threads on host threads, kernel objects and waits, critical sections, timers, files from the disc, GPU front end (`runtime/gpu`), Vulkan renderer: draws, textures, render targets, resolves and frames (`runtime/render`), input from pads, keyboard and mouse (`runtime/input`), saves as host folders, profile, dialogs and notifications (`runtime/kernel`), audio clock, silent XMA decoder (`runtime/apu`); 152 kernel functions implemented, logging stubs for the other 134 |
+| Runtime (`s3native.exe`) | Runs the game's start-up natively: guest memory, loader, guest threads on host threads, kernel objects and waits, critical sections, timers, files from the disc, GPU front end (`runtime/gpu`), Vulkan renderer: draws, textures, render targets, resolves and frames (`runtime/render`), input from pads, keyboard and mouse (`runtime/input`), saves as host folders, profile, dialogs and notifications (`runtime/kernel`), audio clock, XMA decoding through FFmpeg and sound through SDL3 (`runtime/apu`); 152 kernel functions implemented, logging stubs for the other 134 |
 
 ## Requirements
 
 Windows 10 (1803 or later) or 11, x64, a Vulkan 1.3 GPU, Visual Studio 2022
 Build Tools with the C++ workload and the "C++ Clang tools for Windows"
-component, the Vulkan SDK, Python 3, Git. CMake fetches SDL3 and Dear ImGui on
-first configure; `setup_tools.ps1` fetches XenonRecomp and XenosRecomp.
+component, the Vulkan SDK, Python 3, Git. CMake fetches SDL3, Dear ImGui and
+FFmpeg's source on first configure; `setup_tools.ps1` fetches XenonRecomp and
+XenosRecomp.
 
 ## From your ISO to a running game
 
@@ -83,6 +84,8 @@ powershell -ExecutionPolicy Bypass -File scripts\build.ps1
    example `--press start:40,a:50`). `--profile-thread <n>` samples where
    guest thread n spends its time, and `--vblank-hz <n>` overrides the
    vertical blank rate the launcher's frame rate cap sets (twice the cap).
+   `--mute` plays silence, and `--audio-wav <file>` records the sound to a
+   WAV file.
 
 Controls: any SDL3 pad (Xbox, PlayStation, Switch), or keyboard and mouse:
 WASD for the left stick, mouse movement for the right stick (flick-it),
